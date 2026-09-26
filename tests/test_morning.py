@@ -86,3 +86,30 @@ def test_error_while_planning_does_not_lose_the_day(calls, db, monkeypatch):
         morning.tick(CFG, db, T(7))
     assert db.get_meta(morning.MORNING_SENT) in (None, "")       # next tick will try again
     assert db.get_meta(morning.IN_PROGRESS) == ""
+
+
+def test_calendar_review_goes_out_once_before_the_checkin(calls, db, monkeypatch):
+    order = []
+    cfg = {**CFG, "calendar_watch": {"daily_review": True}}
+    monkeypatch.setattr(morning, "send_review", lambda c, st, now: order.append("review") or True)
+    orig = morning.send_checkin
+    monkeypatch.setattr(morning, "send_checkin", lambda *a, **k: order.append("checkin") or orig(*a, **k))
+    morning.tick(cfg, db, T(6, 45))
+    morning.tick(cfg, db, T(7, 0))
+    assert order == ["review", "checkin"]
+
+
+def test_calendar_review_retries_when_telegram_is_down(calls, db, monkeypatch):
+    cfg = {**CFG, "calendar_watch": {"daily_review": True}}
+    tries = []
+
+    def flaky(c, st, now):
+        tries.append(now)
+        if len(tries) == 1:
+            raise TelegramError("sendMessage: network error")
+        return True
+    monkeypatch.setattr(morning, "send_review", flaky)
+    morning.tick(cfg, db, T(6, 45))
+    morning.tick(cfg, db, T(7, 0))
+    morning.tick(cfg, db, T(7, 15))
+    assert len(tries) == 2                                   # failed once, sent on the next tick, then done

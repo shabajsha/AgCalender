@@ -35,6 +35,7 @@ EXPIRE_EVERY_S = 600
 COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
             ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
             ("calendars", "Choose which calendars I ask about, copy, show or ignore"),
+            ("review", "Calendar review now: what's new or changed on your calendars"),
             ("plan", "Plan the rest of today (habits + work blocks)"),
             ("clear", "Remove today's planned blocks"),
             ("pause", "Stop reading mail until /resume"),
@@ -104,6 +105,9 @@ class Listener:
         # Telegram reject the tap and let taps pile up behind each other.)
         self.tg.answer(cq["id"])
         action, _, rest = cq.get("data", "").partition(":")
+        if action in ("crv", "crva"):  # the daily calendar review and "changed" cards
+            calwatch.handle_review(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
+            return
         if action in ("cal", "calb", "cale", "calp", "calc", "calu"):  # events from your other calendars (calwatch.py)
             calwatch.handle_callback(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
             return
@@ -148,6 +152,10 @@ class Listener:
                 self.tg.send("Send /todo followed by the task, one per line, e.g.\n/todo Lab report 2h\nCall bank 15m")
         elif not text.startswith("/") and not LABELS.get(text.lower()) and morning.checkin_open(self.state, today):
             self.add_todos(text, today)
+        elif command == "/review":
+            self.tg.send("Looking at your calendars; the review follows shortly."
+                         if self._run_script("morning.py", "--review", unit="calendar-review-now")
+                         else "Couldn't start the calendar review.")
         elif command == "/calendars":
             calwatch.show_menu(self, datetime.now(ZoneInfo(self.cfg["timezone"])))
         elif command == "/check":

@@ -72,6 +72,8 @@ calendar_watch:
   enabled: true
   days_ahead: 14               # ask about events up to this far ahead
   bulk_after: 5                # more new events than this from one calendar -> one summary card
+  daily_review: true           # new/changed events are collected into ONE daily review (with the morning check-in)
+  urgent_hours: 24             # ...except events starting within this many hours: those are asked about right away
   default: ask                 # calendars not listed (e.g. one you subscribe to later)
   calendars:
     'ulj2rsi883kp2nf4j1p8lfebc2r7mbvg@import.calendar.google.com': ask     # My IIIT App Timetable

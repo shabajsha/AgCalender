@@ -34,6 +34,7 @@ CHECKIN_SENT = "checkin_sent_at"    # when today's question went out
 CHECKIN_ANSWERED = "checkin_done"   # date you tapped Done / Nothing today
 MORNING_SENT = "morning_sent"       # date the morning message went out
 IN_PROGRESS = "morning_in_progress" # when a finish() run started (guards against two at once)
+REVIEW_SENT = "calendar_review_sent" # date the daily calendar review went out
 CHECKIN_FAILS = "checkin_failures"  # "<date>:<count>" of failed check-in sends
 
 
@@ -89,10 +90,41 @@ def finish(cfg, state, now, note=None):
         state.set_meta(IN_PROGRESS, "")
 
 
+def send_review(cfg, state, now):
+    """The daily calendar review (calwatch.daily_review): new / changed / cancelled events, one message."""
+    from googleapiclient.discovery import build
+
+    import calwatch
+    from auth import get_credentials
+    creds = get_credentials()
+    return calwatch.daily_review(cfg, state, build("calendar", "v3", credentials=creds),
+                                 build("tasks", "v1", credentials=creds), Telegram.from_file(), now)
+
+
+def maybe_review(cfg, state, now):
+    """Once a day, just before the check-in (or when the laptop first comes on after plan_after)."""
+    if not cfg.get("calendar_watch", {}).get("daily_review") or state.get_meta(REVIEW_SENT) == now.date().isoformat():
+        return
+    try:
+        sent = send_review(cfg, state, now)
+    except TelegramError as e:
+        log.warning("couldn't send the calendar review (%s); trying again at the next tick", e)
+        return
+    except Exception as e:
+        log.exception("calendar review failed")
+        alerts.alert("review", f"The daily calendar review failed ({type(e).__name__}: {e}).", state)
+        return
+    state.set_meta(REVIEW_SENT, now.date().isoformat())
+    log.info("calendar review: %s", "sent" if sent else "nothing new")
+
+
 def tick(cfg, state, now):
     today = now.date()
     plan_after = slots.at(today, cfg["planner"]["plan_after"], now.tzinfo)
-    if now < plan_after or state.get_meta(MORNING_SENT) == today.isoformat():
+    if now < plan_after:
+        return
+    maybe_review(cfg, state, now)
+    if state.get_meta(MORNING_SENT) == today.isoformat():
         return
     mc = cfg["morning"]
     if not mc.get("checkin", True):
@@ -126,6 +158,7 @@ def main():
     group.add_argument("--tick", action="store_true", help="timer mode: do the next step if it's due")
     group.add_argument("--finish", action="store_true", help="plan and send the morning message now")
     group.add_argument("--start", action="store_true", help="send today's check-in now (testing)")
+    group.add_argument("--review", action="store_true", help="send the calendar review now (/review)")
     args = parser.parse_args()
 
     logsetup.setup("morning")
@@ -136,6 +169,9 @@ def main():
         tick(cfg, state, now)
     elif args.finish:
         finish(cfg, state, now)
+    elif args.review:
+        if not send_review(cfg, state, now):
+            Telegram.from_file().send("Calendar review: nothing new or changed on your calendars since the last one.")
     else:
         for key in (CHECKIN_ANSWERED, MORNING_SENT):
             state.set_meta(key, "")

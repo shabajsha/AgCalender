@@ -173,6 +173,7 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 |---|---|
 | `/todo Lab report 2h` | Adds to-dos (one per line, optional time; default 30 min) to DAILY TASKS, due today, with an Undo button. |
 | `/calendars` | Lists your calendars; tap one to cycle ask / copy / show / ignore. |
+| `/review` | The calendar review right now: what's new, changed or cancelled on your calendars. |
 | `/check`, **Check mail now** | Runs a mail check immediately instead of waiting for the next 30-minute run. |
 | `/plan`, **Plan rest of today** | Re-plans from now: habits, then work blocks (replaces today's not-yet-started blocks). |
 | `/clear` | Removes today's planner-made blocks (also the **Clear today's plan** button under each plan). |
@@ -261,7 +262,15 @@ With every mail check the agent also looks at your other Google calendars (`cale
 | `show` | Counted and shown in the digest, never copied (your own calendar, holidays). |
 | `ignore` | Ignored completely (the **Never ask this calendar** button). |
 
-- Tracked copies **follow the original**: if it moves, the copy moves; if it's cancelled, the copy is removed. You get one short "Calendar updates" message about it.
+- **Daily review** (`daily_review: true`): the calendars are still checked every 30 minutes, but what's found
+  waits for **one message a day**, sent just before the morning check-in (or when the laptop first comes on).
+  It has numbered **New** / **Changed** / **Cancelled** / **Copied automatically** sections, with buttons per
+  item and **Track all new / Ignore all new**. Items update in place as you tap them; anything undecided
+  carries over to the next day's review. Events starting within `urgent_hours` (24) are asked about right
+  away instead. `/review` sends the review now.
+- **Changes are asked about again.** A tracked copy follows the original immediately (moved: the copy moves;
+  cancelled: the copy is removed), and the review asks *Still want it? Keep / Remove*. An event you ignored
+  that changes asks *Track now / Keep ignoring*. A deadline made from a calendar event moves with it.
 - Events that look like deadlines (e.g. Moodle's "Assignment 2 is due") also get **It's a deadline**, which makes a DUE event and task, with effort buttons.
 - An event that already came in as an email invite isn't asked about again.
 - `/calendars` shows every calendar's policy and changes it with a tap.

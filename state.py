@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS watched_events (
     copy_id       TEXT,           -- its copy on College (tracked) or its DUE event (deadline)
     tg_message_id INTEGER,
     batch         INTEGER,        -- summary card it was announced on, if any
+    review        TEXT,           -- waiting for the daily calendar review: new / changed / cancelled / copied
+    review_batch  INTEGER,        -- the review message it was last shown in
     created_at    TEXT,
     decided_at    TEXT,
     UNIQUE (cal_id, event_key)
@@ -136,6 +138,17 @@ class State:
                 os.chmod(path, 0o600)  # it holds email subjects and senders
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Adds columns introduced after a table was first created (CREATE TABLE IF NOT EXISTS won't)."""
+        added = {"watched_events": [("review", "TEXT"), ("review_batch", "INTEGER")]}
+        for table, columns in added.items():
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns:
+                if name not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        self.db.commit()
 
     def is_processed(self, msg_id):
         return self.db.execute("SELECT 1 FROM processed_messages WHERE msg_id = ?", (msg_id,)).fetchone() is not None
@@ -305,7 +318,8 @@ class State:
 
     # --- events watched on your other calendars (calwatch.py) ---------------------------------
 
-    WATCH_FIELDS = {"title", "start", "snapshot", "status", "copy_id", "tg_message_id", "batch", "decided_at"}
+    WATCH_FIELDS = {"title", "start", "snapshot", "status", "copy_id", "tg_message_id", "batch", "decided_at",
+                    "review", "review_batch"}
 
     def watch_get(self, cal_id, event_key):
         row = self.db.execute("SELECT * FROM watched_events WHERE cal_id = ? AND event_key = ?", (cal_id, event_key)).fetchone()
@@ -333,8 +347,15 @@ class State:
         self.db.execute(f"UPDATE watched_events SET {cols} WHERE id = ?", (*fields.values(), row_id))
         self.db.commit()
 
-    def watch_rows(self, cal_id=None, statuses=None, batch=None):
+    def watch_rows(self, cal_id=None, statuses=None, batch=None, review=None, review_batch=None):
+        """review=True: anything waiting for the daily review; a string: that kind only."""
         sql, args = "SELECT * FROM watched_events WHERE 1=1", []
+        if review is True:
+            sql += " AND review IS NOT NULL AND review != ''"
+        elif review:
+            sql, args = sql + " AND review = ?", args + [review]
+        if review_batch is not None:
+            sql, args = sql + " AND review_batch = ?", args + [review_batch]
         if cal_id is not None:
             sql, args = sql + " AND cal_id = ?", args + [cal_id]
         if batch is not None:

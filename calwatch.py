@@ -207,6 +207,22 @@ def card_buttons(row, deadline_like):
     return rows
 
 
+def change_text(cal_label, row, detail):
+    snap = json.loads(row["snapshot"])
+    question = "Track it now?" if row["status"] == "ignored" else "Still want it?"
+    return f"Changed on {cal_label}: {clean_text(row['title'], 200)}\n{detail[:1].upper() + detail[1:]}.\n{question}" \
+        if detail else f"Changed on {cal_label}: {clean_text(row['title'], 200)}\n{snap.get('when', '')}\n{question}"
+
+
+def change_buttons(row, prefix=""):
+    """Buttons for a changed event (also used, numbered, in the daily review)."""
+    rid = row["id"]
+    if row["status"] == "ignored":
+        return [[(f"{prefix}Track now", f"crv:t:{rid}"), (f"{prefix}Keep ignoring", f"crv:k:{rid}")]]
+    remove = "Remove deadline" if row["status"] == "deadline" else "Remove"
+    return [[(f"{prefix}Keep", f"crv:k:{rid}"), (f"{prefix}{remove}", f"crv:r:{rid}")]]
+
+
 class Watcher:
     """One pass over your calendars, or one button press. `tg` may be None only in a dry run."""
 
@@ -217,6 +233,10 @@ class Watcher:
         self.calendars = load_calendars(cal, cfg, state)
         self.by_id = {c["id"]: c for c in self.calendars}
         self.notes, self.stats = [], Counter()
+        wc = cfg.get("calendar_watch", {})
+        # daily review: findings wait for one daily message, except events in the next `urgent_hours`
+        self.review_mode = bool(wc.get("daily_review"))
+        self.urgent = timedelta(hours=wc.get("urgent_hours", 24))
 
     def _label(self, cal_id):
         return self.by_id[cal_id]["label"] if cal_id in self.by_id else "a calendar you removed"
@@ -275,15 +295,55 @@ class Watcher:
         if not rows or self.dry_run:
             return
         if c["policy"] == "copy":
-            titles = [r["title"] for r in rows if self.track(r)]
-            if titles:
+            tracked = [r for r in rows if self.track(r)]
+            if self.review_mode and tracked and not any(self._urgent(r) for r in tracked):
+                for r in tracked:
+                    self.state.watch_set(r["id"], review="copied")
+            elif tracked:
+                titles = [r["title"] for r in tracked]
                 self.notes.append(f"- Copied {len(titles)} new event(s) from {c['label']} into College: "
                                   + ", ".join(titles[:5]) + (" ..." if len(titles) > 5 else ""))
-        elif len(group_rows(rows)) > bulk_after:
-            self._bulk_card(c, rows)
+            return
+        now_rows = []
+        for group in group_rows(rows):
+            if self.review_mode and not any(self._urgent(r) for r in group):
+                for r in group:
+                    self.state.watch_set(r["id"], review="new")  # asked about in the daily review
+                self.stats["queued"] += 1
+            else:
+                now_rows += group
+        if len(group_rows(now_rows)) > bulk_after:
+            self._bulk_card(c, now_rows)
         else:
-            for group in group_rows(rows):
+            for group in group_rows(now_rows):
                 self._send_card(group)
+
+    def _urgent(self, row):
+        """Starts (or started) within the next `urgent_hours`: too soon to wait for tomorrow's review."""
+        return self._row_start(self.state.watch_row(row["id"]) or row) < self.now + self.urgent
+
+    def _changed(self, c, row, detail, old_style_note=None):
+        """A decided event changed. Review mode: ask again (now if it's soon, else in the daily review)."""
+        if not self.review_mode:
+            if old_style_note:
+                self.notes.append(old_style_note)
+            return
+        snap = json.loads(self.state.watch_row(row["id"])["snapshot"])
+        snap["change"] = detail
+        if self._urgent(row):
+            fresh = self.state.watch_row(row["id"])
+            message_id = self.tg.send(change_text(self._label(row["cal_id"]), fresh, detail), change_buttons(fresh))
+            self.state.watch_set(row["id"], snapshot=snap, tg_message_id=message_id, batch=None, review=None)
+        else:
+            self.state.watch_set(row["id"], snapshot=snap, review="changed")
+
+    def _cancelled(self, c, row, detail):
+        if self.review_mode and not self._urgent(row):
+            snap = json.loads(row["snapshot"])
+            snap["change"] = detail
+            self.state.watch_set(row["id"], snapshot=snap, review="cancelled")
+        else:
+            self.notes.append(f"- {row['title']} was cancelled on {c['label']}; {detail}.")
 
     def _send_card(self, group):
         group = group if isinstance(group, list) else [group]
@@ -321,12 +381,16 @@ class Watcher:
             source = self._get(c["id"], row["event_key"]) if row["is_series"] else ev
             if source:
                 google_writer.update_copy(self.cal, self.college, row["copy_id"], source)
-            self.notes.append(f"- {title} ({c['label']}) changed: now {snap['when']}. The College copy was updated.")
+            self._changed(c, row, f"now {snap['when']}; your College copy was updated",
+                          f"- {title} ({c['label']}) changed: now {snap['when']}. The College copy was updated.")
         elif row["status"] == "deadline" and row["copy_id"]:
             due = due_of(ev, self.tz)
             google_writer.move_deadline(self.cal, self.tasks, self.cfg, row["copy_id"],
                                         self.state.task_for_event(row["copy_id"]), due)
-            self.notes.append(f"- Deadline {title} ({c['label']}) moved to {due:%a %d %b %H:%M}. Your deadline and task moved too.")
+            self._changed(c, row, f"now due {due:%a %d %b %H:%M}; your deadline and task moved too",
+                          f"- Deadline {title} ({c['label']}) moved to {due:%a %d %b %H:%M}. Your deadline and task moved too.")
+        elif row["status"] == "ignored":
+            self._changed(c, row, f"now {snap['when']}")  # you ignored it before; maybe it suits you now
         elif row["status"] == "pending" and row["tg_message_id"] and not row["batch"]:
             self.tg.edit(row["tg_message_id"], card_text(c["label"], row), card_buttons(row, snap.get("deadline_like")))
 
@@ -341,20 +405,19 @@ class Watcher:
         if self.dry_run:
             print(f"WOULD NOTE CANCELLED ({c['label']}): {title}", flush=True)
             return
+        self.state.watch_set(row["id"], status="gone", decided_at=self.now.isoformat(), review=None)
         if row["status"] == "tracked" and row["copy_id"]:
             google_writer.delete_event(self.cal, self.college, row["copy_id"])
-            self.notes.append(f"- {title} was cancelled on {c['label']}; its copy was removed from College.")
+            self._cancelled(c, row, "its copy was removed from College")
         elif row["status"] == "deadline":
-            self.notes.append(f"- {title} disappeared from {c['label']}. Your deadline is still there; "
-                              "delete it if the deadline was dropped.")
+            self._cancelled(c, row, "your deadline is still there; delete it if the deadline was dropped")
         elif row["status"] == "pending" and row["tg_message_id"] and not row["batch"]:
             self.tg.edit(row["tg_message_id"], card_text(c["label"], row) + f"\n\nCancelled on {c['label']}.")
-        self.state.watch_set(row["id"], status="gone", decided_at=self.now.isoformat())
 
     def _expire(self):
         for row in self.state.watch_rows(statuses=["pending"]):
             if self._row_start(row) < self.now:
-                self.state.watch_set(row["id"], status="expired", decided_at=self.now.isoformat())
+                self.state.watch_set(row["id"], status="expired", decided_at=self.now.isoformat(), review=None)
                 if row["tg_message_id"] and not row["batch"] and not self.dry_run:
                     self.tg.edit(row["tg_message_id"], card_text(self._label(row["cal_id"]), row)
                                  + "\n\nThe event has passed; nothing was added.")
@@ -437,6 +500,8 @@ def _decided_text(w, rows, outcome):
 def _rerender(w, row_ids, skip_message=None):
     """Redraw every card these rows appear on, after Undo or a calendar-wide change: one edit per message."""
     rows = [w.state.watch_row(i) for i in row_ids]
+    for n in {r["review_batch"] for r in rows if r.get("review_batch")}:
+        _refresh_review(w, n)
     done = {skip_message}
     for r in rows:
         mid = r["tg_message_id"]
@@ -460,6 +525,19 @@ def _rerender(w, row_ids, skip_message=None):
                                                     "deadline": "Added as a deadline."}.get(group[0]["status"], "")))
 
 
+def _remove_deadline(w, row):
+    """Deletes a deadline made from a calendar event: its DUE event, its task, and our record of it."""
+    task_id = w.state.task_for_event(row["copy_id"])
+    google_writer.delete_event(w.cal, w.college, row["copy_id"])
+    if task_id:
+        try:
+            w.tasks.tasks().delete(tasklist=w.cfg.get("tasklist", "@default"), task=task_id).execute()
+        except HttpError as e:
+            if e.resp.status not in (404, 410):
+                raise
+    w.state.delete_item_by_event(row["copy_id"])
+
+
 def _save_undo(state, record):
     n = int(state.get_meta("calundo_seq") or 0) + 1
     state.set_meta("calundo_seq", str(n))
@@ -477,27 +555,21 @@ def _undo(w, n):
     if rec.get("policy") is not None:
         key = w.by_id[rec["cal_id"]]["key"] if rec["cal_id"] in w.by_id else rec["cal_id"]
         w.state.set_meta(f"calpolicy:{key}", rec["policy"])  # "" = back to what config.yaml says
-    for row_id, status, copy_id in rec["rows"]:
+    for entry in rec["rows"]:
+        row_id, status, copy_id = entry[:3]
         row = w.state.watch_row(row_id)
         if row["status"] == "tracked" and row["copy_id"] and row["copy_id"] != copy_id:
             google_writer.delete_event(w.cal, w.college, row["copy_id"])
         elif row["status"] == "deadline" and row["copy_id"]:
-            task_id = w.state.task_for_event(row["copy_id"])
-            google_writer.delete_event(w.cal, w.college, row["copy_id"])
-            if task_id:
-                try:
-                    w.tasks.tasks().delete(tasklist=w.cfg.get("tasklist", "@default"), task=task_id).execute()
-                except HttpError as e:
-                    if e.resp.status not in (404, 410):
-                        raise
-            w.state.delete_item_by_event(row["copy_id"])
-        w.state.watch_set(row_id, status=status, copy_id=copy_id, decided_at=None)
+            _remove_deadline(w, row)
+        w.state.watch_set(row_id, status=status, copy_id=copy_id, decided_at=None,
+                          **({"review": entry[3]} if len(entry) > 3 else {}))
     w.state.set_meta(f"calundo:{n}", "")  # one Undo per press
     return [r[0] for r in rec["rows"]]
 
 
 def _snapshot_rows(rows):
-    return [[r["id"], r["status"], r["copy_id"]] for r in rows]
+    return [[r["id"], r["status"], r["copy_id"], r.get("review")] for r in rows]
 
 
 def handle_callback(listener, cq, action, rest, now):
@@ -648,6 +720,174 @@ def _apply_policy_to_calendar(w, cal_id, policy, skip_message=None):
             w.ignore(r)
         touched.append(r["id"])
     _rerender(w, touched, skip_message=skip_message)
+
+
+# --- the daily calendar review ---------------------------------------------------------------------------
+
+REVIEW_BUTTONS = 8  # items with their own buttons in one review message; the rest via "One by one"
+OUTCOME = {"tracked": "tracked", "ignored": "ignored", "deadline": "deadline", "gone": "cancelled",
+           "expired": "passed", "pending": "waiting - card below"}
+SECTION = {"new": "New", "changed": "Changed", "cancelled": "Cancelled", "copied": "Copied automatically"}
+
+
+def daily_review(cfg, state, cal, tasks_api, tg, now):
+    """One message with everything new, changed or cancelled on your calendars since the last review, with
+    Track / Ignore (or Keep / Remove) per item. Returns True if there was anything to send."""
+    w = Watcher(cfg, state, cal, tasks_api, tg, now)
+    w.run()  # a fresh look first; non-urgent findings are only queued by it
+    waiting = state.watch_rows(review=True)
+    items = [["new", [r["id"] for r in g]]
+             for g in group_rows([r for r in waiting if r["review"] == "new" and r["status"] == "pending"])]
+    items += [["changed", [r["id"] for r in g]] for g in group_rows(
+        [r for r in waiting if r["review"] == "changed" and r["status"] in ("tracked", "ignored", "deadline")])]
+    items += [[r["review"], [r["id"]]] for r in waiting if r["review"] in ("cancelled", "copied")]
+    for r in waiting:  # flags that no longer apply (e.g. decided on a card in between)
+        if not any(r["id"] in ids for _, ids in items):
+            state.watch_set(r["id"], review=None)
+    if not items:
+        return False
+    n = int(state.get_meta("review_seq") or 0) + 1
+    state.set_meta("review_seq", str(n))
+    record = {"items": items, "date": now.date().isoformat()}
+    state.set_meta(f"review:{n}", json.dumps(record))
+    for kind, ids in items:
+        for i in ids:  # cancelled / copied are just news: shown once
+            state.watch_set(i, review_batch=n, **({"review": None} if kind in ("cancelled", "copied") else {}))
+    previous = state.get_meta("review_last")
+    old = json.loads(state.get_meta(f"review:{previous}") or "{}") if previous else {}
+    still_open = any(_item_open(k, state.watch_row(ids[0])) for k, ids in old.get("items", []) if k in ("new", "changed"))
+    if old.get("message_id") and still_open:  # its open items move to the new review
+        tg.edit(old["message_id"], "This review was replaced by a newer one below.")
+    text, buttons = render_review(w, n, record)
+    record["message_id"] = tg.send(text, buttons)
+    state.set_meta(f"review:{n}", json.dumps(record))
+    state.set_meta("review_last", str(n))
+    return True
+
+
+def _item_open(kind, row):
+    return (kind == "new" and row["status"] == "pending" and row["review"] == "new") or \
+           (kind == "changed" and row["review"] == "changed")
+
+
+def render_review(w, n, record):
+    lines, buttons, number, open_new, open_total = [f"Calendar review - {date.fromisoformat(record['date']):%a %d %b}"], [], 0, [], 0
+    for kind in ("new", "changed", "cancelled", "copied"):
+        entries = [ids for k, ids in record["items"] if k == kind]
+        if not entries:
+            continue
+        lines.append(f"\n{SECTION[kind]}")
+        for ids in entries:
+            rows = [w.state.watch_row(i) for i in ids]
+            r0, snap = rows[0], json.loads(rows[0]["snapshot"])
+            when = group_repeats(rows) if r0["is_series"] else snap.get("when", "")
+            title, where = clean_text(r0["title"], 70), w._label(r0["cal_id"])
+            if kind in ("cancelled", "copied"):
+                lines.append(f"- {title} ({where}): {snap.get('change', 'copied into College') if kind == 'cancelled' else when}")
+                continue
+            number += 1
+            is_open = _item_open(kind, r0)
+            detail = f"; {snap['change']}" if kind == "changed" and snap.get("change") else ""
+            lines.append(f"{number}. {title} ({where}): {when if kind == 'new' else ''}{detail.lstrip('; ') if kind == 'changed' else ''}"
+                         + ("" if is_open else f"  [{OUTCOME.get(r0['status'], r0['status'])}]"))
+            if not is_open:
+                continue
+            open_total += 1
+            if kind == "new":
+                open_new.append(r0)
+            if len(buttons) < REVIEW_BUTTONS:
+                if kind == "new":
+                    row_buttons = [(f"{number} Track", f"crv:t:{r0['id']}"), (f"{number} Ignore", f"crv:i:{r0['id']}")]
+                    if snap.get("deadline_like"):
+                        row_buttons.append((f"{number} Deadline", f"crv:d:{r0['id']}"))
+                    buttons.append(row_buttons)
+                else:
+                    buttons += change_buttons(r0, prefix=f"{number} ")
+    if len(open_new) >= 2:
+        buttons.append([("Track all new", f"crva:t:{n}"), ("Ignore all new", f"crva:i:{n}")])
+    if open_total > REVIEW_BUTTONS:
+        buttons.append([("One by one", f"crva:o:{n}")])
+    if record.get("undo") and w.state.get_meta(f"calundo:{record['undo']}"):
+        buttons.append([("Undo", f"calu:{record['undo']}")])
+    if not open_total:
+        lines.append("\nAll done.")
+    return "\n".join(lines), buttons or None
+
+
+def _refresh_review(w, n):
+    record = json.loads(w.state.get_meta(f"review:{n}") or "{}")
+    if record.get("message_id"):
+        w.tg.edit(record["message_id"], *render_review(w, n, record))
+
+
+def _review_item(state, row):
+    """The rows shown together with `row` in its review (e.g. both weekly slots of a course)."""
+    record = json.loads(state.get_meta(f"review:{row['review_batch']}") or "{}") if row.get("review_batch") else {}
+    for _, ids in record.get("items", []):
+        if row["id"] in ids:
+            return [state.watch_row(i) for i in ids]
+    return siblings(state, row, ["pending", "ignored", "tracked", "deadline"])
+
+
+def handle_review(listener, cq, action, rest, now):
+    """crv:<op>:<row>  one review item or change card: t track, i ignore, k keep, r remove, d deadline
+    crva:<op>:<n>    whole review: t track all new, i ignore all new, o one by one"""
+    w = Watcher(listener.cfg, listener.state, listener.calendar, listener.tasks, listener.tg, now)
+    tg, state = listener.tg, listener.state
+    log.info("review button %s:%s", action, rest)
+    op, _, raw = rest.partition(":")
+    if action == "crva":
+        n = int(raw) if raw.isdigit() else 0
+        record = json.loads(state.get_meta(f"review:{n}") or "{}")
+        rows = [r for r in state.watch_rows(review="new", review_batch=n) if r["status"] == "pending"]
+        if not record or not rows:
+            return
+        if op == "o":
+            for g in group_rows(rows)[:MAX_ONE_BY_ONE]:
+                for r in g:
+                    state.watch_set(r["id"], review=None)
+                w._send_card(g)
+        else:
+            record["undo"] = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None, "rows": _snapshot_rows(rows)})
+            state.set_meta(f"review:{n}", json.dumps(record))
+            for r in rows:
+                w.track(r) if op == "t" else w.ignore(r)
+                state.watch_set(r["id"], review=None)
+        _refresh_review(w, n)
+        return
+
+    row = state.watch_row(int(raw)) if raw.isdigit() else None
+    if row is None:
+        return
+    group = _review_item(state, row)
+    if op == "d":
+        if w.as_deadline(row) is not None:
+            fresh = state.watch_row(row["id"])
+            choices = [(f"{h:g} h", f"cale:{row['id']}:{h}") for h in listener.cfg["planner"]["effort_choices_hours"]]
+            tg.send(f"Added {clean_text(row['title'], 100)} as a deadline (calendar event + task). How much work does it need?",
+                    [choices[:3], choices[3:]])
+            group = [fresh]
+    for r in group:
+        r = state.watch_row(r["id"])
+        if op == "t" and r["status"] in ("pending", "ignored"):
+            w.track(r)
+        elif op == "i" and r["status"] in ("pending", "tracked"):
+            w.ignore(r)
+        elif op == "r":
+            if r["status"] == "tracked":
+                w.ignore(r)
+            elif r["status"] == "deadline":
+                _remove_deadline(w, r)
+                state.watch_set(r["id"], status="ignored", copy_id=None)
+        state.watch_set(r["id"], review=None)  # "k" (keep) only clears the question
+    if row.get("review_batch"):
+        _refresh_review(w, row["review_batch"])
+    else:  # a change card sent right away (the event was less than a day off)
+        fresh = state.watch_row(row["id"])
+        outcome = {"t": "Tracked: copied into College.", "i": "Ignored.", "k": "Kept as it is.",
+                   "r": "Removed.", "d": "Added as a deadline."}.get(op, "")
+        tg.edit(cq["message"]["message_id"], change_text(w._label(row["cal_id"]), fresh, "") .split("\n")[0]
+                + f"\n\n{outcome}")
 
 
 # --- /calendars -------------------------------------------------------------------------------------
