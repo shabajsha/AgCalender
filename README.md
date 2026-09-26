@@ -32,6 +32,10 @@ They are listed in `.gitignore`.
 | `digest.py` | Morning digest: today's events, deadlines in the next 7 days, deadlines with no Planner work block, your own tasks due, items waiting for Add / Skip. `--print` to preview. |
 | `notifiers.py` | Pluggable delivery (`desktop` = notify-send, `telegram`). Add a function to `CHANNELS` for a new channel. |
 | `systemd/` | User units: `calendar-ingest.timer` (every 30 min), `calendar-approvals.service` (always on), `calendar-morning.timer` (check-in, plan, morning message). `calendar-digest.timer` / `calendar-planner.timer` are the older separate versions, now disabled. |
+| `alerts.py` | Tells you on Telegram (else desktop) when something needs you: expired Google login, Ollama lost the GPU, repeated mail-check errors, an email given up on. Once per problem per 6 h. |
+| `logsetup.py` | One rotating log file per script in `logs/` (1 MB, 3 kept). |
+| `gtasks.py` | Paged Google Tasks helpers shared by the planner and the digest. |
+| `tests/` | pytest suite (no network: a fixture blocks Telegram, Google, Ollama, systemd). Run `venv/bin/python -m pytest`. |
 | `eval_extractor.py` | Benchmarks Ollama models on 13 made-up emails with known answers: accuracy, speed, GPU fit, CPU temperature. `python eval_extractor.py gemma2:9b gemma3:4b` |
 | `list_calendars.py` | Prints your calendars' names and IDs, for filling in `config.yaml`. |
 | `test_gmail.py` | Prints the 5 newest emails matching `gmail_query`, to check the query works. |
@@ -108,9 +112,10 @@ CPUQuota=400%
 
 ## Safety and resource guards
 
-- The prompt tells the model the email is untrusted data; at most 5 items per email are kept; titles are stripped of
-  links, line breaks and control characters. The model's output never runs as code, Gmail access is read-only, and
-  the agent only ever *adds* events and tasks.
+- The prompt tells the model the email is untrusted data; at most 5 items per email (and per invite) are kept;
+  titles are stripped of links, line breaks and control characters. The model's output never runs as code and
+  Gmail access is read-only. The agent adds events and tasks only after you tap Add; it deletes only its own
+  planner blocks, the to-dos you Undo, and an event whose task failed to save.
 - `min_free_ram_gb`: if less RAM is free, LLM calls are postponed to the next run (on 26 Sep a full swap plus the
   browser led the kernel to OOM-kill Ollama).
 - `require_gpu`: after an OOM kill Ollama restarted without detecting the NVIDIA GPU and ran the model fully on the
@@ -231,3 +236,14 @@ systemctl --user daemon-reload
 systemctl --user disable --now calendar-planner.timer calendar-digest.timer
 systemctl --user enable --now calendar-morning.timer
 ```
+
+## Development
+
+```bash
+venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+venv/bin/python -m pytest            # ~100 tests, a few seconds, never touches your real accounts
+git log --oneline                    # history; each phase is one or more commits
+```
+
+If the Google login ever expires (you'll get a Telegram alert), run `venv/bin/python auth.py` in a terminal.
+Background jobs never open a browser themselves; they alert and wait.

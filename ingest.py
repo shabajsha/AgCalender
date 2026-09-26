@@ -12,13 +12,14 @@ import fnmatch
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import requests
 from googleapiclient.discovery import build
 
+import alerts
 import approvals
 import google_writer
+import logsetup
 from auth import get_credentials
 from config import load_config
 from extractor import LLMUnavailable, extract_items, matches_keywords
@@ -27,23 +28,10 @@ from ics_import import is_past, parse_ics
 from state import State
 from telegram_bot import Telegram, TelegramError
 
-LOG_DIR = Path(__file__).parent / "logs"
 log = logging.getLogger("ingest")
-
-
-def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    file_handler = logging.FileHandler(LOG_DIR / "ingest.log")
-    file_handler.setFormatter(fmt)
-    console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-    root.addHandler(console)
-    for noisy in ("googleapiclient", "httpx", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+MAX_TRIES = 3        # an email that errors this many times is given up on (with an alert) so it can't block progress
+MAX_ICS_ITEMS = 5    # same cap the LLM path has
+ERROR_RUNS_ALERT = 3
 
 
 def ping_heartbeat(url):
@@ -83,20 +71,23 @@ def items_for(msg, cfg, now):
         items = []
         for raw in msg["ics"]:
             items += [it for it in parse_ics(raw, cfg["timezone"]) if not is_past(it, now)]
-        return items, "no-items"
+        if len(items) > MAX_ICS_ITEMS:
+            log.warning("invite had %d events; keeping the first %d", len(items), MAX_ICS_ITEMS)
+        return items[:MAX_ICS_ITEMS], "no-items"
     if not matches_keywords(msg["subject"] + "\n" + msg["body"], cfg["keywords"]):
         return [], "no-keyword"
     log.info("asking LLM about: %s", msg["subject"])
     return extract_items(msg, cfg["ollama"], cfg["timezone"], cfg["min_confidence"], now), "no-items"
 
 
+@alerts.guard("ingest")
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="print what would be created; write nothing")
     parser.add_argument("--since", type=float, metavar="DAYS", help="look back this many days instead of since last run")
     args = parser.parse_args()
 
-    setup_logging()
+    logsetup.setup("ingest")
     cfg = load_config()
     state = State(dry_run=args.dry_run)
     run_started = datetime.now(timezone.utc)
@@ -118,12 +109,11 @@ def main():
             raise SystemExit(f"approval is enabled but {e}")
     blocked = state.blocked_senders()
 
-    if not args.dry_run:
-        ping_heartbeat(cfg.get("heartbeat_url"))
     paused = state.paused_since()
     if paused and not args.dry_run:
         log.info("mail reading paused since %s (Telegram /pause); nothing read. Send /resume to continue.",
                  paused.astimezone().strftime("%a %d %b %H:%M"))
+        ping_heartbeat(cfg.get("heartbeat_url"))  # paused, but the laptop is alive
         return
 
     creds = get_credentials()
@@ -133,14 +123,18 @@ def main():
 
     prefix = "DRY RUN - " if args.dry_run else ""
     log.info("%sfetching %r after %s", prefix, cfg["gmail_query"], after.astimezone().strftime("%Y-%m-%d %H:%M"))
-    messages = fetch_messages(gmail, cfg["gmail_query"], after, cfg["timezone"])
+    stats = {"seen": 0, "already": 0, "duplicate": 0, "skipped-sender": 0, "no-keyword": 0,
+             "created": 0, "asked": 0, "skipped-existing": 0, "errors": 0, "given-up": 0}
 
-    stats = {"seen": len(messages), "already": 0, "duplicate": 0, "skipped-sender": 0, "no-keyword": 0,
-             "created": 0, "asked": 0, "skipped-existing": 0, "errors": 0}
-    for msg in messages:
-        if state.is_processed(msg["id"]):
+    def already_processed(msg_id):  # checked before download, so old mail isn't fetched again every run
+        stats["seen"] += 1
+        if state.is_processed(msg_id):
             stats["already"] += 1
-            continue
+            return True
+        return False
+
+    messages = fetch_messages(gmail, cfg["gmail_query"], after, cfg["timezone"], skip=already_processed)
+    for msg in messages:
         fp = fingerprint(msg)
         if state.fingerprint_seen(fp):
             stats["duplicate"] += 1
@@ -176,20 +170,37 @@ def main():
                 state.record_item(key, item["type"], event_id, task_id, item["title"], str(item["due"] or item["start"]), msg["id"])
                 stats["created"] += 1
             state.mark_processed(msg["id"], fp, "items" if items else outcome)
-        except LLMUnavailable as e:
+        except LLMUnavailable as e:  # temporary (RAM, GPU, Ollama down): retry without counting it against the email
             stats["errors"] += 1
             log.error("Ollama unavailable (%s); will retry %r next run", e, msg["subject"])
-        except Exception:
-            stats["errors"] += 1
-            log.exception("failed on message %s (%r); will retry next run", msg["id"], msg["subject"])
+        except Exception as e:
+            tries = state.record_failure(msg["id"], f"{type(e).__name__}: {e}")
+            log.exception("failed on message %s (%r), attempt %d of %d", msg["id"], msg["subject"], tries, MAX_TRIES)
+            if tries >= MAX_TRIES:
+                state.mark_processed(msg["id"], fp, "failed")
+                stats["given-up"] += 1
+                if not args.dry_run:
+                    alerts.alert(f"gave-up:{msg['id']}", f"Couldn't read the email {msg['subject']!r} after {tries} tries "
+                                 f"({type(e).__name__}); skipping it. Please check it yourself.", state)
+            else:
+                stats["errors"] += 1
 
-    if not args.dry_run and stats["errors"] == 0:
-        state.set_last_run(run_started)
+    if not args.dry_run:
+        if stats["errors"] == 0:
+            state.set_last_run(run_started)
+        error_runs = int(state.get_meta("ingest_error_runs") or 0) + 1 if stats["errors"] else 0
+        state.set_meta("ingest_error_runs", str(error_runs))
+        if error_runs >= ERROR_RUNS_ALERT:
+            alerts.alert("ingest-errors", f"The last {error_runs} mail checks had errors (see logs/ingest.log). "
+                         "New mail may not be reaching you.", state)
+        elif not error_runs:
+            alerts.resolved("ingest-errors", state)
+        ping_heartbeat(cfg.get("heartbeat_url"))
     verb = "would create" if args.dry_run else "created"
     log.info("%sseen %d | already processed %d | duplicate forwards %d | skipped sender %d | no keyword %d | %s %d | "
-             "asked on Telegram %d | existing %d | errors %d",
+             "asked on Telegram %d | existing %d | errors %d | given up %d",
              prefix, stats["seen"], stats["already"], stats["duplicate"], stats["skipped-sender"], stats["no-keyword"], verb,
-             stats["created"], stats["asked"], stats["skipped-existing"], stats["errors"])
+             stats["created"], stats["asked"], stats["skipped-existing"], stats["errors"], stats["given-up"])
 
 
 if __name__ == "__main__":

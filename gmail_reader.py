@@ -3,8 +3,10 @@ import base64
 import hashlib
 import html
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from dateutil import parser as dparser
 
 ICS_MIME_TYPES = {"text/calendar", "application/ics"}
 # Mailman footer appended to list mail, e.g. "____\nStudents mailing list -- ..."
@@ -48,7 +50,7 @@ def split_forward_header(body):
     """Removes the 'From: / Sent: / To: / Subject:' block Outlook puts at the top of a forward.
 
     The two forwarders produce this block in different formats (IST vs UTC 'Sent:'), so it must be
-    removed before fingerprinting. Returns (from_line, body_without_header); from_line keeps the
+    removed before fingerprinting. Returns (from_line, sent_line, body_without_header). from_line keeps the
     mailing-list address, e.g. 'life@lists.iiit.ac.in <...> On Behalf Of gaming club <...>'.
     """
     lines = body.splitlines()
@@ -56,9 +58,34 @@ def split_forward_header(body):
     from_idx = next((i for i, l in enumerate(head) if l.startswith("From:")), None)
     subj_idx = next((i for i, l in enumerate(head) if l.startswith("Subject:")), None)
     if from_idx is None or subj_idx is None or subj_idx < from_idx:
-        return "", body
+        return "", "", body
     from_line = lines[from_idx][len("From:"):].strip()
-    return from_line, "\n".join(lines[subj_idx + 1:]).strip()
+    sent_line = next((l[len("Sent:"):].strip() for l in lines[from_idx:subj_idx] if l.startswith("Sent:")), "")
+    return from_line, sent_line, "\n".join(lines[subj_idx + 1:]).strip()
+
+
+UTC_OFFSET_RE = re.compile(r"\(UTC([+-])(\d{1,2}):?(\d{2})\)")
+
+
+def parse_sent(sent_line, received):
+    """When the original email was sent, from the forward's 'Sent:' line. Two forms arrive:
+    'Saturday, 26 September 2026 04:36:57' (UTC, from Power Automate) and
+    'Saturday, September 26, 2026 10:00:00 AM (UTC+05:30) Chennai, Kolkata, ...' (Outlook).
+    Returns an aware datetime, or None if it can't be parsed or is implausibly far from `received`."""
+    if not sent_line:
+        return None
+    tz = timezone.utc
+    if m := UTC_OFFSET_RE.search(sent_line):
+        sign = 1 if m[1] == "+" else -1
+        tz = timezone(sign * timedelta(hours=int(m[2]), minutes=int(m[3])))
+        sent_line = sent_line[:m.start()]
+    try:
+        sent = dparser.parse(sent_line.strip(), fuzzy=True).replace(tzinfo=tz)
+    except (ValueError, OverflowError):
+        return None
+    if abs(sent - received) > timedelta(days=3):
+        return None  # a mangled header shouldn't move dates around
+    return sent.astimezone(received.tzinfo)
 
 
 def real_sender(from_line):
@@ -82,8 +109,9 @@ def _ics_attachments(service, msg_id, payload):
     return found
 
 
-def fetch_messages(service, base_query, after, tz_name):
-    """Returns messages matching base_query received after `after` (datetime), oldest first."""
+def fetch_messages(service, base_query, after, tz_name, skip=None):
+    """Returns messages matching base_query received after `after` (datetime), oldest first.
+    skip(msg_id) -> True drops a message before it is downloaded (e.g. already processed)."""
     tz = ZoneInfo(tz_name)
     query = f"{base_query} after:{int(after.timestamp())}"
     ids, page_token = [], None
@@ -96,15 +124,19 @@ def fetch_messages(service, base_query, after, tz_name):
 
     messages = []
     for msg_id in ids:
+        if skip and skip(msg_id):
+            continue
         full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
         payload = full["payload"]
         headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
         received = datetime.fromtimestamp(int(full["internalDate"]) / 1000, timezone.utc).astimezone(tz)
-        from_line, body = split_forward_header(_body_text(payload))
+        from_line, sent_line, body = split_forward_header(_body_text(payload))
         messages.append({
             "id": msg_id,
             "subject": FW_PREFIX_RE.sub("", headers.get("subject", "")).strip(),
             "received": received,
+            # relative dates ("tomorrow") count from when the original was sent, not when it was forwarded
+            "reference": parse_sent(sent_line, received) or received,
             "from_line": from_line,
             "sender": real_sender(from_line),
             "body": body,
@@ -121,6 +153,11 @@ def fingerprint(msg):
 
 
 def sender_address(sender):
-    """'Prof X <x@iiit.ac.in>' -> 'x@iiit.ac.in' (lowercase); used to remember your choices per sender."""
-    m = re.search(r"[\w.+-]+@[\w.-]+", sender or "")
-    return m[0].lower() if m else (sender or "unknown").strip().lower()
+    """'Prof X <x@iiit.ac.in>' -> 'x@iiit.ac.in' (lowercase); used to remember your choices per sender.
+    The address in the last <...> wins, so an address typed into the display name can't impersonate someone."""
+    sender = sender or ""
+    bracketed = re.findall(r"<([^<>\s]+@[^<>\s]+)>", sender)
+    if bracketed:
+        return bracketed[-1].lower()
+    m = re.search(r"[\w.+-]+@[\w.-]+", sender)
+    return m[0].lower() if m else (sender.strip().lower() or "unknown")

@@ -1,6 +1,6 @@
 """Parses .ics calendar invites into items (no LLM involved)."""
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from icalendar import Calendar
@@ -15,6 +15,44 @@ def _to_local(value, tz):
     if isinstance(value, datetime):
         return value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
     return value  # plain date
+
+
+def _exdates(ev, tz):
+    """Dates removed from a repeating invite, as Google Calendar EXDATE lines (kept so they stay removed)."""
+    lines = []
+    raw = ev.get("exdate")
+    for group in (raw if isinstance(raw, list) else [raw] if raw else []):
+        for d in group.dts:
+            value = _to_local(d.dt, tz)
+            if isinstance(value, datetime):
+                lines.append("EXDATE:" + value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+            else:
+                lines.append("EXDATE;VALUE=DATE:" + value.strftime("%Y%m%d"))
+    return lines
+
+
+DAY_NAMES = {"MO": "Mon", "TU": "Tue", "WE": "Wed", "TH": "Thu", "FR": "Fri", "SA": "Sat", "SU": "Sun"}
+
+
+def describe_recurrence(recurrence):
+    """['RRULE:FREQ=WEEKLY;BYDAY=TU,TH;UNTIL=20261130T000000Z'] -> 'weekly on Tue, Thu until 30 Nov 2026'."""
+    rule = next((r[len("RRULE:"):] for r in recurrence if r.startswith("RRULE:")), "")
+    parts = dict(p.split("=", 1) for p in rule.split(";") if "=" in p)
+    text = {"DAILY": "daily", "WEEKLY": "weekly", "MONTHLY": "monthly", "YEARLY": "yearly"}.get(parts.get("FREQ"), rule)
+    if parts.get("INTERVAL", "1") != "1":
+        text = f"every {parts['INTERVAL']} {parts.get('FREQ', '').lower().rstrip('ly').replace('dai', 'day')}s"
+    if "BYDAY" in parts:
+        text += " on " + ", ".join(DAY_NAMES.get(d[-2:], d) for d in parts["BYDAY"].split(","))
+    if "UNTIL" in parts:
+        try:
+            text += " until " + datetime.strptime(parts["UNTIL"][:8], "%Y%m%d").strftime("%d %b %Y")
+        except ValueError:
+            pass
+    elif "COUNT" in parts:
+        text += f", {parts['COUNT']} times"
+    else:
+        text += ", with no end date"
+    return text
 
 
 def parse_ics(raw, tz_name):
@@ -50,7 +88,7 @@ def parse_ics(raw, tz_name):
             "course": None,
             "location": str(ev.get("location", "")) or None,
             "description": str(ev.get("description", ""))[:2000] or None,
-            "recurrence": ["RRULE:" + rrule.to_ical().decode()] if rrule else None,
+            "recurrence": (["RRULE:" + rrule.to_ical().decode()] + _exdates(ev, tz)) if rrule else None,
         })
     return items
 

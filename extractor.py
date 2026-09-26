@@ -18,7 +18,7 @@ TIME_IN_TEXT_RE = re.compile(r"\d\s*(am|pm)\b|\d:\d\d", re.IGNORECASE)
 
 SYSTEM_PROMPT = "You extract calendar items from university emails. Reply with JSON only."
 
-USER_PROMPT = """Email received on {received}.
+USER_PROMPT = """Email sent on {received}.
 From: {sender}
 Subject: {subject}
 Body:
@@ -116,10 +116,15 @@ def validate(raw, received, tz_name, min_confidence, now):
     return clean[:MAX_ITEMS_PER_EMAIL]
 
 
+def _reference(msg):
+    """The original send time when the forward header had one, else when it reached Gmail."""
+    return msg.get("reference") or msg["received"]
+
+
 def extract_items(msg, llm, tz_name, min_confidence, now):
     """`llm` is the `ollama:` section of config.yaml."""
     prompt = USER_PROMPT.format(
-        received=msg["received"].strftime("%A, %d %B %Y"),  # no time: the model copied it into items
+        received=_reference(msg).strftime("%A, %d %B %Y"),  # no time: the model copied it into items
         sender=msg.get("sender") or "unknown",
         subject=msg["subject"],
         body=msg["body"][:MAX_BODY_CHARS],
@@ -130,4 +135,4 @@ def extract_items(msg, llm, tz_name, min_confidence, now):
     except json.JSONDecodeError:
         log.warning("model returned invalid JSON for %r: %.200s", msg["subject"], content)
         return []
-    return validate(raw, msg["received"], tz_name, min_confidence, now)
+    return validate(raw, _reference(msg), tz_name, min_confidence, now)

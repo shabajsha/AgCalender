@@ -1,6 +1,7 @@
 """Creates Google Calendar events and Google Tasks from items."""
 
 SOURCE_TAG = "calendar-agent"
+DUE_PREFIX = "DUE: "  # deadline events are titled "DUE: <title>"; the digest and planner find them by this
 PLANNER_TAG = "calendar-agent-planner"  # habits and work blocks; see list_blocks()
 
 
@@ -15,7 +16,7 @@ def _gmail_link(msg_id):
 
 
 def event_title(item):
-    return f"DUE: {item['title']}" if item["type"] == "deadline" else item["title"]
+    return f"{DUE_PREFIX}{item['title']}" if item["type"] == "deadline" else item["title"]
 
 
 def create_event(calendar, calendar_id, item, msg, tz_name):
@@ -57,9 +58,16 @@ def create_task(tasks, tasklist, item, msg):
 
 
 def create_item(calendar, tasks, cfg, item, msg):
-    """Event on the college calendar, plus a task for deadlines. Returns (event_id, task_id)."""
+    """Event on the college calendar, plus a task for deadlines. Returns (event_id, task_id).
+    If the task can't be created, the event is removed again so a retry doesn't leave a duplicate."""
     event_id = create_event(calendar, cfg["calendars"]["college"], item, msg, cfg["timezone"])
-    task_id = create_task(tasks, cfg.get("tasklist", "@default"), item, msg) if item["type"] == "deadline" else None
+    if item["type"] != "deadline":
+        return event_id, None
+    try:
+        task_id = create_task(tasks, cfg.get("tasklist", "@default"), item, msg)
+    except Exception:
+        delete_event(calendar, cfg["calendars"]["college"], event_id)
+        raise
     return event_id, task_id
 
 
@@ -102,3 +110,24 @@ def delete_event(calendar, calendar_id, event_id):
     except HttpError as e:
         if e.resp.status not in (404, 410):
             raise
+
+
+def list_events(calendar, calendar_id, start, end):
+    """All non-cancelled events overlapping [start, end), recurring ones expanded."""
+    events, token = [], None
+    while True:
+        resp = calendar.events().list(calendarId=calendar_id, timeMin=start.isoformat(), timeMax=end.isoformat(),
+                                      singleEvents=True, orderBy="startTime", maxResults=250, pageToken=token).execute()
+        events += [e for e in resp.get("items", []) if e.get("status") != "cancelled"]
+        token = resp.get("nextPageToken")
+        if not token:
+            return events
+
+
+def busy_calendar_ids(calendar, configured):
+    """Every calendar you have switched on in Google Calendar, plus the agent's own ones."""
+    ids = set(configured)
+    for c in calendar.calendarList().list(maxResults=250).execute().get("items", []):
+        if c.get("selected") and not c.get("hidden") and not c.get("deleted"):
+            ids.add(c["id"])
+    return sorted(ids)

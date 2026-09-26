@@ -56,4 +56,7 @@ def chat_json(llm, system, user):
         ollama.generate(model=llm["model"], prompt="", keep_alive=0)  # unload now
         log.error("Ollama ran %s without the GPU; unloaded it and paused LLM calls for this run. "
                   "Fix: sudo systemctl restart ollama", llm["model"])
+        import alerts  # here, not at the top: alerts -> state/telegram shouldn't load for every LLM user
+        alerts.alert("gpu", "Ollama lost the NVIDIA GPU and would run the model on the CPU (hot, 6 GB RAM), so "
+                            "emails are waiting unread. Fix: sudo systemctl restart ollama")
     return resp["message"]["content"]

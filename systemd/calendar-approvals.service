@@ -1,6 +1,5 @@
 [Unit]
 Description=Calendar agent: act on Telegram Add / Skip taps
-After=network-online.target
 
 [Service]
 Type=simple

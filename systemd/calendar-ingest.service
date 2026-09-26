@@ -1,6 +1,5 @@
 [Unit]
 Description=Calendar agent: read new IIITH mail and ask about new items
-After=network-online.target ollama.service
 
 [Service]
 Type=oneshot

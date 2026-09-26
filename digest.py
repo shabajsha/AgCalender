@@ -14,13 +14,16 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 
 from auth import get_credentials
+import google_writer
+import gtasks
+import logsetup
+import alerts
 from config import load_config
-from google_writer import PLANNER_TAG
+from google_writer import DUE_PREFIX, PLANNER_TAG
 from notifiers import deliver
 from state import State
 
-LOG_DIR = Path(__file__).parent / "logs"
-DUE_PREFIX = "DUE: "
+LOG_DIR = logsetup.LOG_DIR
 log = logging.getLogger("digest")
 
 
@@ -36,34 +39,12 @@ def _event_times(event, tz):
     return date.fromisoformat(s["date"]), date.fromisoformat(e["date"]), True
 
 
-def fetch_events(cal, calendar_id, start, end):
-    events, token = [], None
-    while True:
-        resp = cal.events().list(calendarId=calendar_id, timeMin=start.isoformat(), timeMax=end.isoformat(),
-                                 singleEvents=True, orderBy="startTime", maxResults=250, pageToken=token).execute()
-        events += [e for e in resp.get("items", []) if e.get("status") != "cancelled"]
-        token = resp.get("nextPageToken")
-        if not token:
-            return events
+fetch_events = google_writer.list_events  # kept under the old name for callers and tests
 
 
 def fetch_tasks(tasks, skip_list_id, due_before):
     """Open tasks with a due date before `due_before` from every list except the agent's own. -> [(due, title, list)]"""
-    found = []
-    for tl in tasks.tasklists().list().execute().get("items", []):
-        if tl["id"] == skip_list_id:
-            continue  # agent tasks duplicate the DUE: events, which carry the exact time
-        token = None
-        while True:
-            resp = tasks.tasks().list(tasklist=tl["id"], showCompleted=False, showHidden=False,
-                                      dueMax=f"{due_before.isoformat()}T00:00:00.000Z", pageToken=token).execute()
-            for t in resp.get("items", []):
-                if t.get("due") and t.get("title"):
-                    found.append((date.fromisoformat(t["due"][:10]), t["title"], tl["title"]))
-            token = resp.get("nextPageToken")
-            if not token:
-                break
-    return sorted(found)
+    return [(t["due"], t["title"], t["list_title"]) for t in gtasks.open_dated_tasks(tasks, skip_list_id, due_before)]
 
 
 def has_work_block(deadline, blocks):
@@ -150,21 +131,13 @@ def render(title, sections, markdown=False):
     return "\n\n".join(f"{h}\n" + "\n".join(lines) for h, lines in sections)
 
 
-def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
-    handler = logging.FileHandler(LOG_DIR / "digest.log")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
-    for noisy in ("googleapiclient", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
+@alerts.guard("digest")
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--print", action="store_true", help="print the digest only; send and write nothing")
     args = parser.parse_args()
 
-    setup_logging()
+    logsetup.setup("digest")
     cfg = load_config()
     now = datetime.now(ZoneInfo(cfg["timezone"]))
     title, sections = build_digest(cfg, now)

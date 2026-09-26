@@ -85,6 +85,7 @@ planner:
   effort_choices_hours: [2, 4, 8, 12, 20, 30]
   task_effort_hours: 1         # your own Google Tasks that have a due date
   horizon_days: 14             # only deadlines within this many days are planned
+  carry_over_days: 3           # your tasks overdue by up to this many days are planned today
 
 # Habits are placed before work, inside their window, on the listed days (mon..sun; omit days = every day).
 # Nothing is placed until you add your own. Examples:

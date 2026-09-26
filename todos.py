@@ -45,17 +45,19 @@ def fmt_minutes(minutes):
 
 
 def add(tasks_api, tasklist, state, day, todos):
-    """Creates the tasks (due `day`), stores their effort, and returns (batch, [(title, minutes)])."""
-    created = []
+    """Creates the tasks (due `day`), stores their effort, and returns (batch, [(title, minutes)]).
+    Each task is recorded as soon as it exists, so Undo covers it even if a later one fails."""
+    batch, created = state.next_todo_batch(), []
     for title, minutes in todos:
         task = tasks_api.tasks().insert(tasklist=tasklist, body={
             "title": title,
             "notes": f"About {fmt_minutes(minutes)} (added from Telegram)",
             "due": f"{day.isoformat()}T00:00:00.000Z",
         }).execute()
+        state.add_todo(batch, task["id"], title, minutes, day)
         state.set_effort(f"task:{task['id']}", minutes / 60)
-        created.append((task["id"], title, minutes))
-    return state.add_todos(day, created), [(t, m) for _, t, m in created]
+        created.append((title, minutes))
+    return batch, created
 
 
 def undo(tasks_api, tasklist, state, batch):

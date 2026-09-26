@@ -10,24 +10,30 @@ Free time is computed in Python (slots.py); the LLM only ranks the work (ranker.
 Only blocks this script made (tagged calendar-agent-planner) are ever moved or deleted.
 """
 import argparse
+import fcntl
 import logging
 import math
+import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 
+import alerts
 import google_writer
+import gtasks
+import logsetup
 import ranker
 import slots
 from auth import get_credentials
 from config import load_config
-from digest import DUE_PREFIX, fetch_events
+from google_writer import DUE_PREFIX, list_events as fetch_events
 from notifiers import deliver
 from state import State
 
-LOG_DIR = Path(__file__).parent / "logs"
+LOCK_FILE = logsetup.LOG_DIR / ".planner.lock"
+LOCK_WAIT_S = 60
 DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 log = logging.getLogger("planner")
 
@@ -48,28 +54,27 @@ def busy_intervals(events, tz):
 
 
 def open_work(cal, tasks_api, cfg, state, now, horizon):
-    """Deadlines (DUE events) and your own dated tasks, each with its effort in hours."""
-    pc, tz = cfg["planner"], now.tzinfo
+    """Deadlines (DUE events) and your own dated tasks, each with its effort in hours.
+    Deadlines whose task you've ticked off are left out; tasks overdue by up to carry_over_days are planned today."""
+    pc, tz, today = cfg["planner"], now.tzinfo, now.date()
     items = []
+    finished = gtasks.completed_ids(tasks_api, cfg["tasklist"]) if cfg.get("tasklist") else set()
     for ev in fetch_events(cal, cfg["calendars"]["college"], now, horizon):
-        if ev.get("summary", "").startswith(DUE_PREFIX):
-            key = f"event:{ev['id']}"
-            items.append({"key": key, "title": ev["summary"][len(DUE_PREFIX):], "due": _local(ev["end"], tz),
-                          "effort_h": state.get_effort(key) or pc["default_effort_hours"]})
-    for tl in tasks_api.tasklists().list().execute().get("items", []):
-        if tl["id"] == cfg.get("tasklist"):
-            continue  # agent tasks mirror the DUE events above
-        resp = tasks_api.tasks().list(tasklist=tl["id"], showCompleted=False, showHidden=False,
-                                      dueMax=f"{horizon.date().isoformat()}T00:00:00.000Z").execute()
-        for t in resp.get("items", []):
-            if not t.get("due") or not t.get("title"):
-                continue
-            due = datetime.combine(date.fromisoformat(t["due"][:10]), slots.hm("23:59"), tz)
-            if due < now:
-                continue  # overdue tasks show in the digest; there's no window left to plan them into
-            key = f"task:{t['id']}"
-            items.append({"key": key, "title": t["title"], "due": due,
-                          "effort_h": state.get_effort(key) or pc["task_effort_hours"]})
+        if not ev.get("summary", "").startswith(DUE_PREFIX):
+            continue
+        if state.task_for_event(ev["id"]) in finished:
+            continue  # you've completed its task: stop planning it
+        key = f"event:{ev['id']}"
+        items.append({"key": key, "title": ev["summary"][len(DUE_PREFIX):], "due": _local(ev["end"], tz),
+                      "effort_h": state.get_effort(key) or pc["default_effort_hours"]})
+    carry = timedelta(days=pc.get("carry_over_days", 3))
+    for t in gtasks.open_dated_tasks(tasks_api, cfg.get("tasklist"), horizon.date()):
+        if t["due"] < today - carry:
+            continue  # long overdue: the digest lists it; planning it today would crowd everything else out
+        due = datetime.combine(max(t["due"], today), slots.hm("23:59"), tz)  # recently overdue -> today
+        key = f"task:{t['id']}"
+        items.append({"key": key, "title": t["title"] + (" (overdue)" if t["due"] < today else ""), "due": due,
+                      "effort_h": state.get_effort(key) or pc["task_effort_hours"]})
     return items
 
 
@@ -83,7 +88,37 @@ def minutes_today(item, done_min, today, min_block):
     return min(remaining, max(share, min_block)), remaining
 
 
+class PlannerBusy(Exception):
+    """Another plan was still running after LOCK_WAIT_S."""
+
+
+@contextmanager
+def planning_lock(wait_s=LOCK_WAIT_S):
+    """Only one plan at a time (two taps on Plan, or Done during the morning run, used to double-book)."""
+    LOCK_FILE.parent.mkdir(exist_ok=True)
+    with open(LOCK_FILE, "w") as f:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise PlannerBusy("another plan is still running")
+                time.sleep(1)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def plan_today(cfg, state, now, dry_run=False, how="manual"):
+    """Plans the rest of today. Returns (title, text, number of things placed or reported)."""
+    with planning_lock():
+        return _plan_today(cfg, state, now, dry_run, how)
+
+
+def _plan_today(cfg, state, now, dry_run, how):
     tz, today, pc = now.tzinfo, now.date(), cfg["planner"]
     gap = pc["gap_minutes"]
     creds = get_credentials()
@@ -105,7 +140,7 @@ def plan_today(cfg, state, now, dry_run=False, how="manual"):
 
     # 2. Free time from now to midnight: minus every calendar's busy time (with gaps) and sleep.
     busy = []
-    for cid in ("primary", cals["college"], cals["planner"], cals["habits"]):
+    for cid in google_writer.busy_calendar_ids(cal, ["primary", cals["college"], cals["planner"], cals["habits"]]):
         events = fetch_events(cal, cid, day_start, day_end)
         if cid in earlier:
             removed = {b["id"] for b in earlier[cid]} - {b["id"] for b in kept[cid]}
@@ -148,7 +183,9 @@ def plan_today(cfg, state, now, dry_run=False, how="manual"):
     work_blocks, short = [], []
     for it in ranked:
         want = min(it["today_min"], cap)
-        blocks, work_free = slots.fill(work_free, want, pc["block_minutes"], pc["min_block_minutes"], gap)
+        before_due = slots.intersect(work_free, (day_start, it["due"] - timedelta(minutes=gap)))  # never after it's due
+        blocks, _ = slots.fill(before_due, want, pc["block_minutes"], pc["min_block_minutes"], gap)
+        work_free = slots.subtract(work_free, slots.pad(blocks, gap))
         got = sum((e - s).total_seconds() / 60 for s, e in blocks)
         cap -= got
         work_blocks += [(it, b) for b in blocks]
@@ -200,15 +237,7 @@ def clear_day(cfg, day):
     return removed
 
 
-def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
-    handler = logging.FileHandler(LOG_DIR / "planner.log")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
-    for noisy in ("googleapiclient", "urllib3", "httpx"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
+@alerts.guard("planner")
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--auto", action="store_true", help="timer mode: plan once per day after plan_after")
@@ -217,7 +246,7 @@ def main():
     parser.add_argument("--date", type=date.fromisoformat, help="YYYY-MM-DD for --clear")
     args = parser.parse_args()
 
-    setup_logging()
+    logsetup.setup("planner")
     cfg = load_config()
     state = State()
     now = datetime.now(ZoneInfo(cfg["timezone"]))

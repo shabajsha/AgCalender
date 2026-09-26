@@ -1,7 +1,8 @@
 """SQLite state (state.db): processed emails, created items, items waiting for your approval, sender choices."""
 import json
+import os
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "state.db"
@@ -47,6 +48,12 @@ CREATE TABLE IF NOT EXISTS plans (
     planned_at TEXT,
     how        TEXT               -- auto / manual / cleared
 );
+CREATE TABLE IF NOT EXISTS failures (
+    msg_id     TEXT PRIMARY KEY,  -- an email that raised an error; retried until MAX tries, then given up
+    count      INTEGER,
+    last_error TEXT,
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS todos (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     batch      INTEGER,           -- one bot message = one batch (what its Undo button removes)
@@ -90,7 +97,8 @@ def _now():
 
 
 class State:
-    def __init__(self, dry_run=False, path=DB_PATH):
+    def __init__(self, dry_run=False, path=None):
+        path = path or DB_PATH  # looked up at call time so tests can point DB_PATH at a temp file
         if dry_run:
             # Work on an in-memory copy so dedupe still behaves, but nothing touches disk.
             self.db = sqlite3.connect(":memory:")
@@ -98,15 +106,29 @@ class State:
                 with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as src:
                     src.backup(self.db)
         else:
-            self.db = sqlite3.connect(path, timeout=30)  # ingest.py and approvals.py share it
+            self.db = sqlite3.connect(path, timeout=30)  # several processes share it
+            if path != ":memory:":
+                os.chmod(path, 0o600)  # it holds email subjects and senders
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
 
     def is_processed(self, msg_id):
         return self.db.execute("SELECT 1 FROM processed_messages WHERE msg_id = ?", (msg_id,)).fetchone() is not None
 
-    def fingerprint_seen(self, fingerprint):
-        return self.db.execute("SELECT 1 FROM processed_messages WHERE fingerprint = ?", (fingerprint,)).fetchone() is not None
+    def fingerprint_seen(self, fingerprint, within_days=2):
+        """Same content seen recently? Double forwards arrive seconds apart; an identical weekly reminder a week
+        later is a new email and must not be dropped."""
+        since = (datetime.now(timezone.utc) - timedelta(days=within_days)).isoformat(timespec="seconds")
+        return self.db.execute("SELECT 1 FROM processed_messages WHERE fingerprint = ? AND processed_at >= ?",
+                               (fingerprint, since)).fetchone() is not None
+
+    def record_failure(self, msg_id, error):
+        """Counts an error for this email; returns how many times it has failed."""
+        self.db.execute("INSERT INTO failures VALUES (?, 1, ?, ?) ON CONFLICT(msg_id) DO UPDATE SET "
+                        "count = count + 1, last_error = excluded.last_error, updated_at = excluded.updated_at",
+                        (msg_id, str(error)[:300], _now()))
+        self.db.commit()
+        return self.db.execute("SELECT count FROM failures WHERE msg_id = ?", (msg_id,)).fetchone()[0]
 
     def mark_processed(self, msg_id, fingerprint, outcome):
         self.db.execute("INSERT OR REPLACE INTO processed_messages VALUES (?, ?, ?, ?)",
@@ -200,6 +222,11 @@ class State:
     def blocked_senders(self):
         return {r["sender"] for r in self.db.execute("SELECT sender FROM sender_prefs WHERE pref = 'blocked'")}
 
+    def task_for_event(self, event_id):
+        """The Google Task created together with a DUE event, if any."""
+        row = self.db.execute("SELECT task_id FROM created_items WHERE event_id = ?", (event_id,)).fetchone()
+        return row["task_id"] if row else None
+
     def event_id_for(self, dedupe_key):
         row = self.db.execute("SELECT event_id FROM created_items WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
         return row["event_id"] if row else None
@@ -235,14 +262,14 @@ class State:
 
     # --- to-dos added from Telegram ------------------------------------------------------------
 
-    def add_todos(self, day, items):
-        """items: [(task_id, title, minutes)]. Returns the batch number."""
-        batch = (self.db.execute("SELECT COALESCE(MAX(batch), 0) FROM todos").fetchone()[0] or 0) + 1
-        self.db.executemany("INSERT INTO todos (batch, task_id, title, minutes, day, status, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, 'active', ?)",
-                            [(batch, tid, title, minutes, day.isoformat(), _now()) for tid, title, minutes in items])
+    def next_todo_batch(self):
+        return (self.db.execute("SELECT COALESCE(MAX(batch), 0) FROM todos").fetchone()[0] or 0) + 1
+
+    def add_todo(self, batch, task_id, title, minutes, day):
+        """Recorded right after each task is created, so Undo covers it even if a later one fails."""
+        self.db.execute("INSERT INTO todos (batch, task_id, title, minutes, day, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'active', ?)", (batch, task_id, title, minutes, day.isoformat(), _now()))
         self.db.commit()
-        return batch
 
     def todo_batch(self, batch):
         return [dict(r) for r in self.db.execute("SELECT * FROM todos WHERE batch = ? AND status = 'active'", (batch,))]

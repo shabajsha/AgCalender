@@ -1,5 +1,6 @@
-"""Google OAuth helper: returns valid credentials, running the browser flow only when needed."""
+"""Google OAuth helper: returns valid credentials, running the browser flow only when someone is there to use it."""
 import os
+import sys
 from pathlib import Path
 
 from google.auth.exceptions import RefreshError
@@ -16,19 +17,29 @@ SCOPES = [
 HERE = Path(__file__).parent
 CREDENTIALS_FILE = HERE / "credentials.json"  # OAuth client (Desktop app)
 TOKEN_FILE = HERE / "token.json"              # your saved login; created on first run
+LOGIN_TIMEOUT_S = 300
+
+
+class AuthExpired(Exception):
+    """The saved login can't be used or refreshed, and there's no terminal to log in again from."""
 
 
 def _save(creds):
-    TOKEN_FILE.write_text(creds.to_json())
-    os.chmod(TOKEN_FILE, 0o600)
+    """Atomic write, readable only by you from the moment the file exists."""
+    tmp = TOKEN_FILE.with_name(TOKEN_FILE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(creds.to_json())
+    os.replace(tmp, TOKEN_FILE)
 
 
-def _run_flow():
-    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-    return flow.run_local_server(port=0)
+def _is_interactive():
+    return sys.stdin is not None and sys.stdin.isatty()
 
 
-def get_credentials():
+def get_credentials(interactive=None):
+    """interactive=None means "only if run from a terminal". Services and timers never open a browser:
+    they raise AuthExpired instead (an old version waited forever for a login nobody could see)."""
     creds = None
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
@@ -47,11 +58,16 @@ def get_credentials():
         except RefreshError:
             pass  # revoked or expired refresh token -> log in again
 
-    creds = _run_flow()
+    if interactive is None:
+        interactive = _is_interactive()
+    if not interactive:
+        raise AuthExpired("Google login missing, expired or revoked; run `python auth.py` in a terminal")
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+    creds = flow.run_local_server(port=0, timeout_seconds=LOGIN_TIMEOUT_S)
     _save(creds)
     return creds
 
 
 if __name__ == "__main__":
-    get_credentials()
+    get_credentials(interactive=True)
     print("Authenticated OK; token saved to token.json")

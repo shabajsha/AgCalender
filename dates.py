@@ -2,13 +2,17 @@
 
 The LLM only copies the words; all date arithmetic happens here, deterministically.
 """
+import calendar
 import re
 from datetime import date, datetime, time, timedelta
 
 from dateutil import parser as dparser
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-WEEKDAY_RE = re.compile(r"\b(?:(this|next|coming)\s+)?(mon|tue|wed|thu|fri|sat|sun)[a-z]*\b")
+# Whole weekday words only: an older "mon[a-z]*" pattern turned "month" and "monitor" into Monday.
+WEEKDAY_RE = re.compile(r"\b(?:(this|next|coming)\s+)?(monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu"
+                        r"|friday|fri|saturday|sat|sunday|sun)\b")
+END_OF_MONTH_RE = re.compile(r"\bend of (?:the |this )?(next )?month\b")
 ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 YEAR_RE = re.compile(r"\b\d{4}\b")
 
@@ -16,9 +20,10 @@ YEAR_RE = re.compile(r"\b\d{4}\b")
 def resolve_date(text, received):
     """`received` is a date. Returns a date or None if the words don't name a specific day.
 
-    Weekdays ("Friday", "this Friday", "next Friday") resolve to the nearest upcoming one after
-    `received`. "Next Friday" is ambiguous mid-week; the earlier date is chosen because an early
-    reminder is safer than a missed deadline.
+    Weekdays resolve to the nearest upcoming one: "Friday" / "this Friday" written on a Friday means
+    today; "next Friday" written on a Friday means a week later. Mid-week, "next Friday" is ambiguous
+    and the earlier date is chosen, because an early reminder is safer than a missed deadline.
+    "End of the month" is the month's last day.
     """
     if not isinstance(text, str) or not text.strip():
         return None
@@ -38,9 +43,17 @@ def resolve_date(text, received):
     if m := re.search(r"\bin (\d+) days?\b", t):
         return received + timedelta(days=int(m[1]))
 
+    if m := END_OF_MONTH_RE.search(t):
+        year, month = received.year, received.month
+        if m[1]:  # "end of next month"
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        return date(year, month, calendar.monthrange(year, month)[1])
+
     has_digit = re.search(r"\d", t)
     if (m := WEEKDAY_RE.search(t)) and not has_digit:
-        ahead = (WEEKDAYS[m[2]] - received.weekday()) % 7 or 7
+        ahead = (WEEKDAYS[m[2][:3]] - received.weekday()) % 7
+        if ahead == 0 and m[1] == "next":
+            ahead = 7
         return received + timedelta(days=ahead)
 
     if not has_digit:

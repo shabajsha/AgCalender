@@ -12,10 +12,11 @@ Steps, once a day, starting the first time the laptop is on after planner.plan_a
 import argparse
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import alerts
 import digest
+import logsetup
 import planner
 import slots
 from config import load_config
@@ -23,13 +24,17 @@ from notifiers import deliver
 from state import State
 from telegram_bot import Telegram, TelegramError
 
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = logsetup.LOG_DIR
+IN_PROGRESS_STALE = timedelta(minutes=15)
+CHECKIN_GIVE_UP_TRIES = 4  # ~1 h of failed check-in sends (Telegram down): plan without asking
 log = logging.getLogger("morning")
 
 # state.meta keys; values are ISO dates/times
 CHECKIN_SENT = "checkin_sent_at"    # when today's question went out
 CHECKIN_ANSWERED = "checkin_done"   # date you tapped Done / Nothing today
 MORNING_SENT = "morning_sent"       # date the morning message went out
+IN_PROGRESS = "morning_in_progress" # when a finish() run started (guards against two at once)
+CHECKIN_FAILS = "checkin_failures"  # "<date>:<count>" of failed check-in sends
 
 
 def checkin_open(state, today):
@@ -56,20 +61,32 @@ def send_checkin(cfg, state, now, late):
 
 
 def finish(cfg, state, now, note=None):
+    """Plan + morning message. Marked as done only once the message is out, so a failure (no network yet
+    after wake-up, Google hiccup) is retried at the next tick instead of losing the day."""
     today = now.date()
     if state.get_meta(MORNING_SENT) == today.isoformat():
         return  # Done tapped twice, or the timer got here first
-    state.set_meta(MORNING_SENT, today.isoformat())  # before the slow part, so a parallel run stops above
-
-    plan_title, plan_text, _ = planner.plan_today(cfg, state, now, how="auto")
-    _, sections = digest.build_digest(cfg, now, skip_planner_blocks=True)
-    sections.insert(1, (plan_title.replace("Plan for", "Your plan for"), plan_text.splitlines()))
-    title = f"Good morning - {now:%a %d %b}"
-    text = ((note + "\n\n") if note else "") + digest.render(title, sections)
-    (LOG_DIR / "digest.md").write_text(digest.render(title, sections, markdown=True))
-    sent = deliver(title, text, cfg.get("digest", {}).get("channels", ["desktop"]),
-                   buttons=[("Clear today's plan", f"clear:{today.isoformat()}")])
-    log.info("morning message sent via %s", ", ".join(sent) or "nothing")
+    started = state.get_meta(IN_PROGRESS)
+    if started and now - datetime.fromisoformat(started) < IN_PROGRESS_STALE:
+        log.info("another morning run is in progress; leaving it to finish")
+        return
+    state.set_meta(IN_PROGRESS, now.isoformat())
+    try:
+        plan_title, plan_text, _ = planner.plan_today(cfg, state, now, how="auto")
+        _, sections = digest.build_digest(cfg, now, skip_planner_blocks=True)
+        sections.insert(1, (plan_title.replace("Plan for", "Your plan for"), plan_text.splitlines()))
+        title = f"Good morning - {now:%a %d %b}"
+        text = ((note + "\n\n") if note else "") + digest.render(title, sections)
+        (LOG_DIR / "digest.md").write_text(digest.render(title, sections, markdown=True))
+        sent = deliver(title, text, cfg.get("digest", {}).get("channels", ["desktop"]),
+                       buttons=[("Clear today's plan", f"clear:{today.isoformat()}")])
+        if not sent:
+            log.warning("morning message couldn't be delivered on any channel; retrying at the next tick")
+            return
+        state.set_meta(MORNING_SENT, today.isoformat())
+        log.info("morning message sent via %s", ", ".join(sent))
+    finally:
+        state.set_meta(IN_PROGRESS, "")
 
 
 def tick(cfg, state, now):
@@ -86,8 +103,14 @@ def tick(cfg, state, now):
         try:
             send_checkin(cfg, state, now, late=now > plan_after + timedelta(minutes=30))
         except TelegramError as e:
-            log.error("couldn't send the check-in (%s); planning without it", e)
-            finish(cfg, state, now)
+            day, _, count = (state.get_meta(CHECKIN_FAILS) or "").partition(":")
+            fails = (int(count) if day == today.isoformat() else 0) + 1
+            state.set_meta(CHECKIN_FAILS, f"{today.isoformat()}:{fails}")
+            if fails < CHECKIN_GIVE_UP_TRIES:
+                log.warning("couldn't send the check-in (%s); trying again at the next tick", e)
+            else:
+                log.error("couldn't reach Telegram for the check-in %d times; planning without it", fails)
+                finish(cfg, state, now, note="Couldn't reach Telegram this morning, so there was no check-in.")
         return
     if state.get_meta(CHECKIN_ANSWERED) == today.isoformat():
         finish(cfg, state, now)
@@ -96,15 +119,7 @@ def tick(cfg, state, now):
                                      "and tasks. Add to-dos any time with /todo, then tap 'Plan rest of today'.")
 
 
-def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
-    handler = logging.FileHandler(LOG_DIR / "morning.log")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
-    for noisy in ("googleapiclient", "urllib3", "httpx"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
+@alerts.guard("morning")
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -113,7 +128,7 @@ def main():
     group.add_argument("--start", action="store_true", help="send today's check-in now (testing)")
     args = parser.parse_args()
 
-    setup_logging()
+    logsetup.setup("morning")
     cfg = load_config()
     state = State()
     now = datetime.now(ZoneInfo(cfg["timezone"]))

@@ -1,9 +1,9 @@
 [Unit]
 Description=Calendar agent: morning check-in, then plan + morning message (once a day)
-After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=10min
 WorkingDirectory=%h/Documents/calender-agent
 ExecStart=%h/Documents/calender-agent/venv/bin/python morning.py --tick
 Nice=10

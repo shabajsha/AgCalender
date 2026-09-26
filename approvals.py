@@ -18,10 +18,13 @@ from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 
+import alerts
 import google_writer
+import logsetup
 import morning
 import todos
-from auth import get_credentials
+from auth import AuthExpired, get_credentials
+from ics_import import describe_recurrence
 from config import load_config
 from state import State
 from telegram_bot import Telegram, TelegramError
@@ -54,6 +57,8 @@ def format_item(item, subject, sender):
     lines = [f"{kind}: {item['title']}", stamp]
     if item.get("course"):
         lines.append(f"Course: {item['course']}")
+    if item.get("recurrence"):
+        lines.append(f"Repeats {describe_recurrence(item['recurrence'])}")
     lines += [f"From: {sender}", f"Email: {subject}"]
     if item["type"] == "deadline":
         lines.append("Add = calendar event + task")
@@ -215,23 +220,26 @@ class Listener:
         if self.state.get_meta(morning.MORNING_SENT) == today.isoformat():
             started, msg = self._run_planner(), "Re-planning the rest of today with your to-dos."
         else:
-            started, msg = self._run_script("morning.py", "--finish"), "Got it. Planning your day now; the morning message follows shortly."
+            started, msg = (self._run_script("morning.py", "--finish", unit="calendar-morning-now"),
+                            "Got it. Planning your day now; the morning message follows shortly.")
         self.tg.edit(cq["message"]["message_id"], msg if started else "Couldn't start the planner.")
         self.tg.answer(cq["id"], "Planning..." if started else "Error")
         log.info("check-in answered (%s)", answer)
 
     @classmethod
     def _run_planner(cls, *args):
-        return cls._run_script("planner.py", *args)
+        return cls._run_script("planner.py", *args, unit="calendar-plan-now")
 
     @staticmethod
-    def _run_script(script, *args):
-        """Starts a script as its own transient systemd unit, so restarting this listener can't kill it."""
+    def _run_script(script, *args, unit=None):
+        """Starts a script as its own transient systemd unit, so restarting this listener can't kill it.
+        A fixed unit name means a second tap while it's still running is refused instead of doubling up."""
         here = Path(__file__).parent
         cmd = ["systemd-run", "--user", "--no-block", "--collect", f"--working-directory={here}",
-               sys.executable, str(here / script), *args]
+               *([f"--unit={unit}"] if unit else []), sys.executable, str(here / script), *args]
         try:
-            if subprocess.run(cmd, timeout=15, capture_output=True).returncode == 0:
+            done = subprocess.run(cmd, timeout=15, capture_output=True, text=True)
+            if done.returncode == 0 or "already" in done.stderr:  # "... already exists": it's running right now
                 return True
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -321,21 +329,15 @@ class Listener:
                 log.info("expired %r", row["item"]["title"])
 
 
-def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
-    handler = logging.FileHandler(LOG_DIR / "approvals.log")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler, console])
-    for noisy in ("googleapiclient", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
 def main():
-    setup_logging()
+    logsetup.setup("approvals")
     cfg = load_config()
-    listener = Listener(cfg, State(), Telegram.from_file())
+    try:
+        listener = Listener(cfg, State(), Telegram.from_file())
+    except AuthExpired:
+        alerts.alert("auth", alerts.AUTH_TEXT)
+        time.sleep(600)  # systemd restarts us afterwards; waiting keeps that from happening every 30 s
+        raise SystemExit(1)
     try:
         listener.tg.set_commands(COMMANDS)
     except TelegramError as e:
