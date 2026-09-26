@@ -3,6 +3,7 @@ import base64
 import hashlib
 import html
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -112,7 +113,6 @@ def _ics_attachments(service, msg_id, payload):
 def fetch_messages(service, base_query, after, tz_name, skip=None):
     """Returns messages matching base_query received after `after` (datetime), oldest first.
     skip(msg_id) -> True drops a message before it is downloaded (e.g. already processed)."""
-    tz = ZoneInfo(tz_name)
     query = f"{base_query} after:{int(after.timestamp())}"
     ids, page_token = [], None
     while True:
@@ -122,33 +122,41 @@ def fetch_messages(service, base_query, after, tz_name, skip=None):
         if not page_token:
             break
 
-    messages = []
-    for msg_id in ids:
-        if skip and skip(msg_id):
-            continue
-        full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
-        payload = full["payload"]
-        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-        received = datetime.fromtimestamp(int(full["internalDate"]) / 1000, timezone.utc).astimezone(tz)
-        from_line, sent_line, body = split_forward_header(_body_text(payload))
-        messages.append({
-            "id": msg_id,
-            "subject": FW_PREFIX_RE.sub("", headers.get("subject", "")).strip(),
-            "received": received,
-            # relative dates ("tomorrow") count from when the original was sent, not when it was forwarded
-            "reference": parse_sent(sent_line, received) or received,
-            "from_line": from_line,
-            "sender": real_sender(from_line),
-            "body": body,
-            "ics": _ics_attachments(service, msg_id, payload),
-        })
+    messages = [fetch_one(service, msg_id, tz_name) for msg_id in ids if not (skip and skip(msg_id))]
     messages.sort(key=lambda m: m["received"])
     return messages
 
 
+def fetch_one(service, msg_id, tz_name):
+    """One message by id, as the dict the rest of the pipeline uses (also used by "Read anyway")."""
+    tz = ZoneInfo(tz_name)
+    full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    payload = full["payload"]
+    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+    received = datetime.fromtimestamp(int(full["internalDate"]) / 1000, timezone.utc).astimezone(tz)
+    from_line, sent_line, body = split_forward_header(_body_text(payload))
+    return {
+        "id": msg_id,
+        "subject": FW_PREFIX_RE.sub("", headers.get("subject", "")).strip(),
+        "received": received,
+        # relative dates ("tomorrow") count from when the original was sent, not when it was forwarded
+        "reference": parse_sent(sent_line, received) or received,
+        "from_line": from_line,
+        "sender": real_sender(from_line),
+        "body": body,
+        "ics": _ics_attachments(service, msg_id, payload),
+    }
+
+
+QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u201c": '"', "\u201d": '"',
+                        "\u201e": '"', "\u2013": "-", "\u2014": "-", "\u00a0": " "})
+
+
 def fingerprint(msg):
-    """Same email forwarded twice -> same fingerprint (Power Automate sometimes double-forwards)."""
-    normalised = re.sub(r"\s+", " ", (msg["subject"] + "\n" + msg["body"]).lower()).strip()
+    """Same email forwarded twice -> same fingerprint (Power Automate sometimes double-forwards). The two
+    forwarders don't agree on typography (Students' vs Students\u2019), so quotes and dashes are folded first."""
+    text = unicodedata.normalize("NFKC", msg["subject"] + "\n" + msg["body"]).translate(QUOTES)
+    normalised = re.sub(r"\s+", " ", text.lower()).strip()
     return hashlib.sha256(normalised.encode()).hexdigest()
 
 

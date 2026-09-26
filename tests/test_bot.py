@@ -1,3 +1,4 @@
+import itertools
 import time
 from datetime import datetime, timedelta
 
@@ -16,7 +17,7 @@ def bot(db, tg, monkeypatch):
                     "planner": {"default_effort_hours": 3, "effort_choices_hours": [2, 4, 8, 12, 20, 30]},
                     "morning": {"todo_tasklist": "DAILY", "todo_default_minutes": 30}}
     listener.state, listener.tg, listener.tasks, listener.calendar, listener.learn_after = db, tg, FakeTasks(), None, 3
-    listener.runs = []
+    listener.runs, listener._last_error_reply = [], 0.0
     monkeypatch.setattr(approvals.Listener, "_run_script",
                         staticmethod(lambda script, *a, unit=None: listener.runs.append((script, a, unit)) or True))
     monkeypatch.setattr(approvals.Listener, "_start_ingest_now", staticmethod(lambda: listener.runs.append("ingest") or True))
@@ -30,8 +31,11 @@ def deadline(days=4, title="OS Midsem prep", recurrence=None):
             "location": None, "description": None, "recurrence": recurrence}
 
 
+TAP_IDS = itertools.count(1)
+
+
 def tap(bot, data, chat=42):
-    bot.handle({"id": "cb", "data": data, "message": {"chat": {"id": chat}, "message_id": 101}})
+    bot.handle({"id": f"cb{next(TAP_IDS)}", "data": data, "message": {"chat": {"id": chat}, "message_id": 101}})
 
 
 def say(bot, text, age=0):
@@ -44,9 +48,11 @@ def test_add_offers_effort_then_stores_it(bot, tg, db):
     assert [[label for label, _ in row] for row in tg.edits[101]["buttons"]] == [["2 h", "4 h", "8 h"], ["12 h", "20 h", "30 h"]]
     assert db.item_exists("k1") and db.get_pending(1)["status"] == "added"
     tap(bot, "effort:1:20")
-    assert db.get_effort("event:EV1") == 20
-    tap(bot, "add:1")
-    assert tg.answers[-1] == "Already added"
+    assert db.get_effort("event:EV1") == 20 and tg.answers[-1] == "20 h"
+    created = []
+    google_writer.create_item = lambda *a: created.append(a) or ("EV2", "T2")
+    tap(bot, "add:1")                                          # a second tap: answered once, nothing created
+    assert not created and tg.answers[-1] == ""
 
 
 def test_strangers_are_ignored(bot, tg, db):
@@ -81,8 +87,9 @@ def test_plain_text_is_a_todo_only_during_checkin(bot, tg, db):
     assert tg.sent[-1]["text"].startswith("Commands")
     db.set_meta(morning.CHECKIN_SENT, datetime.now(TZ).isoformat())
     say(bot, "Finish lab report 2h\nCall bank 15m")
-    assert ("Done", "checkin:done") in tg.sent[-1]["buttons"]
-    tap(bot, "checkin:done")
+    today = datetime.now(TZ).date().isoformat()
+    assert ("Done", f"checkin:done:{today}") in tg.sent[-1]["buttons"]
+    tap(bot, f"checkin:done:{today}")
     assert bot.runs[-1] == ("morning.py", ("--finish",), "calendar-morning-now")
     say(bot, "Gym 1h")
     assert tg.sent[-1]["text"].startswith("Commands")        # check-in closed
@@ -109,3 +116,49 @@ def test_every_tap_is_answered_before_the_slow_work(bot, tg, db, monkeypatch):
     monkeypatch.setattr(approvals.calwatch, "handle_callback", lambda *a: seen.append(list(tg.answers)))
     tap(bot, "cal:t:1")
     assert seen == [[""]]            # the spinner was stopped before calwatch started its Google calls
+
+
+def test_yesterdays_done_button_does_not_start_today(bot, tg, db):
+    yesterday = (datetime.now(TZ) - timedelta(days=1)).date().isoformat()
+    tap(bot, f"checkin:done:{yesterday}")
+    assert not bot.runs and db.get_meta(morning.CHECKIN_ANSWERED) is None
+    assert "check-in for" in tg.edits[101]["text"] and tg.answers[-1] == "Old button"
+
+
+def test_typing_done_closes_the_checkin(bot, tg, db):
+    db.set_meta(morning.CHECKIN_SENT, datetime.now(TZ).isoformat())
+    say(bot, "Done!")
+    assert bot.runs[-1] == ("morning.py", ("--finish",), "calendar-morning-now") and bot.tasks.store == {}
+
+
+def test_plan_and_clear_use_their_own_units(bot, tg):
+    say(bot, "/plan")
+    say(bot, "/clear")
+    assert [r[2] for r in bot.runs[-2:]] == ["calendar-plan-now", "calendar-clear-now"]
+
+
+def test_busy_planner_is_reported_not_claimed(bot, tg, monkeypatch):
+    monkeypatch.setattr(approvals.Listener, "_run_script", staticmethod(lambda script, *a, unit=None: "busy"))
+    say(bot, "/clear")
+    assert tg.sent[-1]["text"].startswith("Already busy")
+
+
+def test_a_failed_tap_is_reported(bot, tg):
+    from googleapiclient.errors import HttpError
+    import httplib2
+    bot.report_error(HttpError(httplib2.Response({"status": 503}), b"unavailable"))
+    assert "Couldn't reach Google" in tg.sent[-1]["text"]
+
+
+def test_skipped_list_and_read_anyway(bot, tg, db):
+    db.mark_processed("gm1", "fp", "no-keyword", subject="Reminder: Mid semester feedback")
+    say(bot, "/skipped")
+    assert "Mid semester feedback" in tg.sent[-1]["text"] and tg.sent[-1]["buttons"] == [[("Read 1", "read:gm1")]]
+    tap(bot, "read:gm1")
+    assert bot.runs[-1] == ("ingest.py", ("--message", "gm1"), "calendar-read-gm1") and tg.answers[-1].startswith("Reading")
+
+
+def test_status_shows_health(bot, tg, db):
+    say(bot, "/status")
+    text = tg.sent[-1]["text"]
+    assert "Google login: OK" in text and "GPU for the model: OK" in text and "Problems in the last 24 h: none" in text

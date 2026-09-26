@@ -6,9 +6,7 @@ Add / Skip. Written to logs/digest.md and sent through the channels in config.ya
 """
 import argparse
 import logging
-import re
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
@@ -28,10 +26,6 @@ LOG_DIR = logsetup.LOG_DIR
 log = logging.getLogger("digest")
 
 
-def _norm(text):
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
 def _event_times(event, tz):
     """(start, end, all_day); datetimes are local, all-day values are dates."""
     s, e = event["start"], event["end"]
@@ -49,18 +43,22 @@ def fetch_tasks(tasks, skip_list_id, due_before):
 
 
 def has_work_block(deadline, blocks):
-    """A planner event before the deadline that is linked to it (Phase 3 sets deadline_event_id) or names it."""
-    title = _norm(deadline["summary"][len(DUE_PREFIX):])
-    for b in blocks:
-        props = b.get("extendedProperties", {}).get("private", {})
-        if props.get("deadline_event_id") == deadline["id"] or (title and title in _norm(b.get("summary", ""))):
-            return True
-    return False
+    """A planner block linked to this deadline (the planner tags blocks with deadline_event_id). Matching by
+    title is gone: a deadline called "AI" counted as planned by any block with "ai" in its name."""
+    return any(b.get("extendedProperties", {}).get("private", {}).get("deadline_event_id") == deadline["id"]
+               for b in blocks)
 
 
-def build_digest(cfg, now, skip_planner_blocks=False):
+def _due_datetime(event, tz):
+    """When a DUE event is due; an all-day one (made by hand) is due at the end of its day."""
+    start, end, all_day = _event_times(event, tz)
+    return datetime.combine(start, time(23, 59), tz) if all_day else end
+
+
+def build_digest(cfg, now, skip_planner_blocks=False, state=None):
     """(title, sections). skip_planner_blocks leaves the planner's own blocks out of "Today" (morning.py lists
     the plan separately)."""
+    state = state or State()
     tz = now.tzinfo
     days = cfg.get("digest", {}).get("days_ahead", 7)
     today = now.date()
@@ -73,8 +71,8 @@ def build_digest(cfg, now, skip_planner_blocks=False):
 
     # Today, across every calendar you have switched on. Tracked events appear through their College copy;
     # events still waiting for Track/Ignore are marked; ignored ones and ignored calendars are left out.
-    today_lines, statuses = [], State().watch_statuses()
-    for c in calwatch.load_calendars(cal, cfg, State()):
+    today_lines, statuses = [], state.watch_statuses()
+    for c in calwatch.load_calendars(cal, cfg, state):
         if not c["selected"] or c["policy"] == "ignore":
             continue
         for ev in fetch_events(cal, c["id"], day_start, day_start + timedelta(days=1)):
@@ -93,14 +91,25 @@ def build_digest(cfg, now, skip_planner_blocks=False):
     # Deadlines the agent created (DUE: events end at the due time), and work blocks on the planner
     deadlines = [ev for ev in fetch_events(cal, calendars["college"], now, horizon)
                  if ev.get("summary", "").startswith(DUE_PREFIX)]
-    blocks = fetch_events(cal, calendars["planner"], now, horizon) if deadlines else []
+    blocks = google_writer.list_blocks(cal, calendars["planner"], now - timedelta(days=60), horizon) if deadlines else []
+    blocks = [b for b in blocks if not _event_times(b, tz)[2]]
+    finished = gtasks.completed_ids(tasks, cfg["tasklist"]) if deadlines and cfg.get("tasklist") else set()
+    pc = cfg.get("planner", {})
     due_lines, unplanned = [], []
     for ev in deadlines:
-        _, due, all_day = _event_times(ev, tz)
+        due = _due_datetime(ev, tz)
+        all_day = _event_times(ev, tz)[2]
         stamp = f"{due:%a %d %b}" if all_day else f"{due:%a %d %b %H:%M}"
         name = ev["summary"][len(DUE_PREFIX):]
+        if state.task_for_event(ev["id"]) in finished:  # you ticked its task off: done, not "unplanned"
+            due_lines.append(f"- {stamp}  {name}  (done)")
+            continue
         due_lines.append(f"- {stamp}  {name}")
-        if not has_work_block(ev, [b for b in blocks if _event_times(b, tz)[0] < due]):
+        linked = [b for b in blocks if _event_times(b, tz)[0] < due and has_work_block(ev, [b])]
+        worked = sum((_event_times(b, tz)[1] - _event_times(b, tz)[0]).total_seconds() / 3600
+                     for b in linked if _event_times(b, tz)[0] < now)
+        effort = state.get_effort(f"event:{ev['id']}") or pc.get("default_effort_hours", 3)
+        if not any(_event_times(b, tz)[0] >= now for b in linked) and worked < effort:
             unplanned.append(f"- {name} (due {stamp})")
 
     # Tasks from your own lists, including overdue ones
@@ -111,15 +120,17 @@ def build_digest(cfg, now, skip_planner_blocks=False):
 
     # Items still waiting for Add / Skip
     waiting = []
-    for row in State().open_pending():
+    for row in state.open_pending():
         item = row["item"]
         when = item["due"] or item["start"]
         if (when if isinstance(when, datetime) else datetime.combine(when, time(23, 59), tz)) >= now:
             stamp = f"{when:%a %d %b %H:%M}" if isinstance(when, datetime) else f"{when:%a %d %b}"
             waiting.append(f"- {item['type'].capitalize()}: {item['title']} ({stamp})")
 
+    skipped = state.skipped_messages(limit=50, since=now - timedelta(days=1))
+
     sections = []
-    paused = State().paused_since()
+    paused = state.paused_since()
     if paused:
         sections.append(("Mail reading is paused", [f"- since {paused.astimezone(tz):%a %d %b %H:%M}. Send /resume in Telegram to continue."]))
     sections += [("Today", today_lines),
@@ -130,6 +141,9 @@ def build_digest(cfg, now, skip_planner_blocks=False):
         sections.append(("Your tasks due soon", task_lines))
     if waiting:
         sections.append((f"Waiting for your Add / Skip ({len(waiting)})", waiting))
+    if skipped:
+        sections.append(("Emails I skipped (no deadline words)",
+                         [f"- {len(skipped)} since yesterday. Send /skipped to see them and read one anyway."]))
     return f"Calendar digest - {now:%a %d %b}", sections
 
 

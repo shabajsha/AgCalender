@@ -10,20 +10,25 @@ Per calendar (config.yaml -> calendar_watch; the bot's buttons and /calendars ov
 Copies follow their original: if it moves, the copy moves; if it's cancelled, the copy is removed. You're told
 about both in one short "Calendar updates" message.
 """
+import fcntl
 import json
 import logging
 import re
 import time as time_module
 from collections import Counter
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urlparse
 
+from dateutil.rrule import rrulestr
 from googleapiclient.errors import HttpError
 
 import google_writer
+import logsetup
 from extractor import clean_text
 from ics_import import describe_recurrence
 from state import dedupe_key
+from telegram_bot import TelegramError
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +100,34 @@ def shown_today(policy, status):
     return policy in ("ask", "copy") and status in (None, "pending")
 
 
+LOCK_FILE = logsetup.LOG_DIR / ".calwatch.lock"
+
+
+class WatchBusy(Exception):
+    """Another calendar scan (the mail check or the daily review) is still running."""
+
+
+@contextmanager
+def watch_lock(wait_s=0):
+    """One calendar scan at a time. At wake-up the mail check and the morning review start together; two scans
+    used to insert the same event twice (a crash and a false alert) or announce one change twice."""
+    LOCK_FILE.parent.mkdir(exist_ok=True)
+    with open(LOCK_FILE, "w") as f:
+        deadline = time_module.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time_module.monotonic() >= deadline:
+                    raise WatchBusy("a calendar scan is already running") from None
+                time_module.sleep(1)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 # --- small helpers on Google event dicts ------------------------------------------------------------
 
 def _start_value(ev):
@@ -130,6 +163,26 @@ def core(ev, is_series, tz):
     return {"summary": ev.get("summary", ""), "when": when, "location": ev.get("location", "")}
 
 
+def series_core(instances, tz):
+    """A series' usual time of day, length, title and place: the most common across its upcoming occurrences,
+    so one moved or cancelled class isn't mistaken for a change to the whole series."""
+    cores = [json.dumps(core(ev, True, tz), sort_keys=True) for ev in instances]
+    return json.loads(Counter(cores).most_common(1)[0][0])
+
+
+def series_ended(master, now):
+    """True if a repeating event has no occurrence left after `now` (its UNTIL / COUNT has run out)."""
+    start = master.get("start", {})
+    try:
+        first = _dt(start.get("dateTime") or start.get("date"), now.tzinfo)
+        if not isinstance(first, datetime):
+            first = datetime.combine(first, time(), now.tzinfo)
+        rule = rrulestr("\n".join(master.get("recurrence") or []), dtstart=first, forceset=True)
+        return rule.after(now) is None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False  # can't tell: keep asking rather than drop it
+
+
 def due_of(ev, tz):
     """For 'It's a deadline': the end of a timed event (or its start if it has no length); all-day -> 23:59."""
     s, e = ev["start"], ev["end"]
@@ -160,10 +213,17 @@ def group_rows(rows):
 def siblings(state, row, statuses):
     """The row plus the other series of the same course (same calendar and title) in one of `statuses`."""
     if not row["is_series"]:
-        return [row]
+        return [row] if row["status"] in statuses else []
     same = [r for r in state.watch_rows(cal_id=row["cal_id"], statuses=statuses)
             if r["is_series"] and norm_title(r["title"]) == norm_title(row["title"])]
-    return same or [row]
+    return same or ([row] if row["status"] in statuses else [])
+
+
+def _card_rows(state, row, message_id):
+    """The rows shown on the tapped card (e.g. both weekly slots of a course). Not every series with that title:
+    Ignore on a card for a newly added third slot used to untrack the two slots you had already tracked."""
+    rows = [r for r in state.watch_rows(message_id=message_id) if r["cal_id"] == row["cal_id"]] if message_id else []
+    return rows if any(r["id"] == row["id"] for r in rows) else [row]
 
 
 def repeats_text(master, instance, tz):
@@ -234,6 +294,7 @@ class Watcher:
         self.by_id = {c["id"]: c for c in self.calendars}
         self.notes, self.stats = [], Counter()
         wc = cfg.get("calendar_watch", {})
+        self.horizon = now + timedelta(days=wc.get("days_ahead", 14))
         # daily review: findings wait for one daily message, except events in the next `urgent_hours`
         self.review_mode = bool(wc.get("daily_review"))
         self.urgent = timedelta(hours=wc.get("urgent_hours", 24))
@@ -241,37 +302,61 @@ class Watcher:
     def _label(self, cal_id):
         return self.by_id[cal_id]["label"] if cal_id in self.by_id else "a calendar you removed"
 
+    def _started(self, ev):
+        value = _dt(_start_value(ev), self.tz)
+        start = value if isinstance(value, datetime) else datetime.combine(value, time(), self.tz)
+        return start <= self.now
+
+    def _fresh(self, row):
+        return self.state.watch_row(row["id"]) or row
+
     # --- the regular pass (called from ingest.py every 30 min and by "Check mail now") ---------------
 
     def run(self):
         wc = self.cfg.get("calendar_watch", {})
-        horizon = self.now + timedelta(days=wc.get("days_ahead", 14))
         for c in self.calendars:
-            if c["policy"] not in ("ask", "copy") or not c["selected"]:
-                continue
-            first = {}
-            for ev in google_writer.list_events(self.cal, c["id"], self.now, horizon):
-                first.setdefault(event_key(ev), ev)  # a series is represented by its next occurrence
+            scan = c["policy"] in ("ask", "copy") and c["selected"]
             known = {r["event_key"]: r for r in self.state.watch_rows(cal_id=c["id"])}
-            new = [(key, ev) for key, ev in first.items() if key not in known]
+            # copies you decided on keep following their original, even after "Never ask" or /calendars -> show
+            followed = {k: r for k, r in known.items() if scan or r["status"] in ("tracked", "deadline")}
+            if not scan and not followed:
+                continue
+            first, instances = {}, {}
+            for ev in google_writer.list_events(self.cal, c["id"], self.now, self.horizon):
+                key = event_key(ev)
+                instances.setdefault(key, []).append(ev)
+                # a series is represented by its next occurrence that hasn't started yet: an occurrence in
+                # progress used to make an unanswered series look "passed" and expire it
+                if key not in first or (self._started(first[key]) and not self._started(ev)):
+                    first[key] = ev
             for key, ev in first.items():
-                if key in known and known[key]["status"] in LIVE + ("ignored",):
-                    self._sync(c, known[key], ev)
-            for key, row in known.items():
-                if key not in first and row["status"] in LIVE and self._row_start(row) > self.now:
+                row = followed.get(key)
+                if row is None:
+                    continue
+                if row["status"] == "gone":
+                    self._revive(c, row, ev)
+                elif row["status"] in LIVE + ("ignored",):
+                    self._sync(c, row, ev, instances[key])
+            for key, row in followed.items():
+                if key not in first and row["status"] in LIVE and (row["is_series"] or self._row_start(row) > self.now):
                     self._check_gone(c, row)
+            new = [(key, ev) for key, ev in first.items() if key not in known] if scan else []
             if new:
-                self._announce(c, new, wc.get("bulk_after", 5))
+                self._announce(c, new, wc.get("bulk_after", 5), instances)
         self._expire()
+        self._requeue_unsent()
         if self.notes and not self.dry_run:
-            self.tg.send("Calendar updates:\n" + "\n".join(self.notes))
+            try:
+                self.tg.send("Calendar updates:\n" + "\n".join(self.notes))
+            except TelegramError as e:
+                log.warning("couldn't send calendar updates (%s): %s", e, " ".join(self.notes))
         return self.stats
 
     def _row_start(self, row):
         value = _dt(row["start"], self.tz)
         return value if isinstance(value, datetime) else datetime.combine(value, time(23, 59), self.tz)
 
-    def _announce(self, c, new, bulk_after):
+    def _announce(self, c, new, bulk_after, instances=None):
         rows = []
         for key, ev in new:
             is_series = bool(ev.get("recurringEventId"))
@@ -282,7 +367,9 @@ class Watcher:
             start = _dt(_start_value(ev), self.tz)
             already = self.state.pending_or_created(dedupe_key({"title": title, "start": start}))
             deadline_like = bool(DEADLINE_RE.search(title)) or any(w in c["label"] for w in ("courses.", "moodle"))
-            snap = {"core": core(ev, is_series, self.tz), "when": when_text(ev, self.tz), "repeats": repeats,
+            series = (instances or {}).get(key, [ev])
+            snap = {"core": series_core(series, self.tz) if is_series else core(ev, False, self.tz),
+                    "when": when_text(ev, self.tz), "repeats": repeats,
                     "repeat_day": repeat_day, "repeat_base": repeat_base, "deadline_like": deadline_like and not is_series}
             if self.dry_run:
                 print(f"WOULD ASK ({c['label']}): {title} - {repeats or snap['when']}"
@@ -295,7 +382,15 @@ class Watcher:
         if not rows or self.dry_run:
             return
         if c["policy"] == "copy":
-            tracked = [r for r in rows if self.track(r)]
+            tracked = []
+            for r in rows:
+                try:
+                    if self.track(r, (instances or {}).get(r["event_key"])):
+                        tracked.append(r)
+                except Exception:  # noqa: BLE001 - one failed copy mustn't strand the rest
+                    log.exception("couldn't copy %r into College; you'll be asked about it instead", r["title"])
+                    if self.review_mode:
+                        self.state.watch_set(r["id"], review="new")
             if self.review_mode and tracked and not any(self._urgent(r) for r in tracked):
                 for r in tracked:
                     self.state.watch_set(r["id"], review="copied")
@@ -312,11 +407,37 @@ class Watcher:
                 self.stats["queued"] += 1
             else:
                 now_rows += group
-        if len(group_rows(now_rows)) > bulk_after:
-            self._bulk_card(c, now_rows)
-        else:
-            for group in group_rows(now_rows):
+        try:
+            if len(group_rows(now_rows)) > bulk_after:
+                self._bulk_card(c, now_rows)
+            else:
+                for group in group_rows(now_rows):
+                    self._send_card(group)
+        except TelegramError as e:  # rows saved but never asked used to block planning time forever
+            log.warning("couldn't send calendar cards (%s); they'll be asked about again", e)
+            if self.review_mode:  # otherwise _requeue_unsent sends the cards again at the next check
+                for r in now_rows:
+                    if not self._fresh(r)["tg_message_id"]:
+                        self.state.watch_set(r["id"], review="new")
+
+    def _requeue_unsent(self):
+        """Undecided events that never got a card (a send failed earlier) are asked about again."""
+        if self.dry_run:
+            return
+        stranded = [r for r in self.state.watch_rows(statuses=["pending"])
+                    if not r["tg_message_id"] and not r["batch"] and not r["review"]
+                    and self.by_id.get(r["cal_id"], {}).get("policy") in ("ask", "copy")]
+        if not stranded:
+            return
+        if self.review_mode:
+            for r in stranded:
+                self.state.watch_set(r["id"], review="new")
+            return
+        try:
+            for group in group_rows(stranded):
                 self._send_card(group)
+        except TelegramError as e:
+            log.warning("couldn't send calendar cards (%s); trying again at the next check", e)
 
     def _urgent(self, row):
         """Starts (or started) within the next `urgent_hours`: too soon to wait for tomorrow's review."""
@@ -332,14 +453,21 @@ class Watcher:
         snap["change"] = detail
         if self._urgent(row):
             fresh = self.state.watch_row(row["id"])
-            message_id = self.tg.send(change_text(self._label(row["cal_id"]), fresh, detail), change_buttons(fresh))
-            self.state.watch_set(row["id"], snapshot=snap, tg_message_id=message_id, batch=None, review=None)
+            try:
+                message_id = self.tg.send(change_text(self._label(row["cal_id"]), fresh, detail), change_buttons(fresh))
+            except TelegramError as e:
+                log.warning("couldn't send a change card (%s); it goes to the review", e)
+                self.state.watch_set(row["id"], snapshot=snap, review="changed")
+                return
+            # review_batch cleared: taps on this card must update this card, not an old review
+            self.state.watch_set(row["id"], snapshot=snap, tg_message_id=message_id, batch=None, review=None,
+                                 review_batch=None)
         else:
             self.state.watch_set(row["id"], snapshot=snap, review="changed")
 
     def _cancelled(self, c, row, detail):
         if self.review_mode and not self._urgent(row):
-            snap = json.loads(row["snapshot"])
+            snap = json.loads(self._fresh(row)["snapshot"])
             snap["change"] = detail
             self.state.watch_set(row["id"], snapshot=snap, review="cancelled")
         else:
@@ -362,10 +490,16 @@ class Watcher:
             self.state.watch_set(r["id"], batch=batch, tg_message_id=message_id)
         self.stats["asked"] += len(rows)
 
-    def _sync(self, c, row, ev):
+    def _sync(self, c, row, ev, instances=None):
         """The original changed? Update our copy (or deadline) and tell you."""
         snap = json.loads(row["snapshot"])
-        new_core, new_start = core(ev, row["is_series"], self.tz), _start_value(ev)
+        if snap.pop("missing", None):  # back after one scan without it: a feed hiccup, not a cancellation
+            self.state.watch_set(row["id"], snapshot=snap)
+        instances = instances or [ev]
+        if row["is_series"] and row["status"] == "tracked" and not self.dry_run:
+            self._sync_copies(row, instances)
+        new_core = series_core(instances, self.tz) if row["is_series"] else core(ev, False, self.tz)
+        new_start = _start_value(ev)
         if new_core == snap["core"]:
             if new_start != row["start"]:
                 self.state.watch_set(row["id"], start=new_start)  # a series moved on to its next occurrence
@@ -377,10 +511,17 @@ class Watcher:
         self.stats["changed"] += 1
         if self.dry_run:
             print(f"WOULD UPDATE ({c['label']}): {title} now {snap['when']}", flush=True)
-        elif row["status"] == "tracked" and row["copy_id"]:
-            source = self._get(c["id"], row["event_key"]) if row["is_series"] else ev
-            if source:
-                google_writer.update_copy(self.cal, self.college, row["copy_id"], source)
+        elif row["status"] == "tracked" and (row["copy_id"] or row["is_series"]):
+            if not row["is_series"]:
+                try:
+                    google_writer.update_copy(self.cal, self.college, row["copy_id"], ev)
+                except HttpError as e:
+                    if e.resp.status not in (404, 410):
+                        raise
+                    self.state.watch_set(row["id"], status="ignored", copy_id=None, decided_at=self.now.isoformat())
+                    self.notes.append(f"- {title} ({c['label']}) changed, but you had deleted its College copy, "
+                                      "so I stopped tracking it.")
+                    return
             self._changed(c, row, f"now {snap['when']}; your College copy was updated",
                           f"- {title} ({c['label']}) changed: now {snap['when']}. The College copy was updated.")
         elif row["status"] == "deadline" and row["copy_id"]:
@@ -394,33 +535,127 @@ class Watcher:
         elif row["status"] == "pending" and row["tg_message_id"] and not row["batch"]:
             self.tg.edit(row["tg_message_id"], card_text(c["label"], row), card_buttons(row, snap.get("deadline_like")))
 
+    def _sync_copies(self, row, instances):
+        """A tracked repeating event is copied occurrence by occurrence for the next `days_ahead` days, so a
+        cancelled or moved class shows up in College exactly (one repeating copy of the series couldn't)."""
+        label, title = self._label(row["cal_id"]), row["title"]
+        if row["copy_id"]:  # made by an older version: one repeating copy for the whole series; end it now
+            google_writer.end_series_copy(self.cal, self.college, row["copy_id"], self.now)
+            self.state.watch_set(row["id"], copy_id=None)
+        existing = {r["instance_key"]: r for r in self.state.series_copies(row["id"])}
+        seen = set()
+        for ev in instances:
+            key, snap = ev["id"], core(ev, False, self.tz)
+            seen.add(key)
+            cur = existing.get(key)
+            if cur is None:
+                if self._started(ev):
+                    continue
+                copy_id = google_writer.create_copy(self.cal, self.college, ev, label,
+                                                    f"{row['cal_id']}|{row['event_key']}|{key}")
+                self.state.series_copy_set(row["id"], key, copy_id, _start_value(ev), snap)
+                continue
+            if json.loads(cur["snapshot"]) != snap and cur["copy_id"]:
+                try:
+                    google_writer.update_copy(self.cal, self.college, cur["copy_id"], ev)
+                    self.notes.append(f"- {title} ({label}): the {when_text(ev, self.tz)} class moved; College updated.")
+                except HttpError as e:
+                    if e.resp.status not in (404, 410):
+                        raise
+                    cur["copy_id"] = ""  # you deleted this one copy: leave it deleted
+            if json.loads(cur["snapshot"]) != snap or cur["missing"]:
+                self.state.series_copy_set(row["id"], key, cur["copy_id"], _start_value(ev), snap)
+        for key, cur in existing.items():
+            if key in seen:
+                continue
+            start = self._row_start({"start": cur["start"]})
+            if start <= self.now:  # already happened: the copy stays in College as history
+                if start < self.now - timedelta(days=1):
+                    self.state.series_copy_delete(row["id"], key)
+                continue
+            if cur["missing"] + 1 < 2:  # wait for a second scan: a feed can come back empty once
+                self.state.series_copy_missing(row["id"], key, cur["missing"] + 1)
+                continue
+            if cur["copy_id"]:
+                google_writer.delete_event(self.cal, self.college, cur["copy_id"])
+            self.state.series_copy_delete(row["id"], key)
+            self.notes.append(f"- {title} ({label}): the {start:%a %d %b %H:%M} one was cancelled; removed from College.")
+
     def _check_gone(self, c, row):
         ev = self._get(c["id"], row["event_key"])
         if ev is not None and ev.get("status") != "cancelled":
+            snap = json.loads(row["snapshot"])
+            if snap.pop("missing", None):
+                self.state.watch_set(row["id"], snapshot=snap)
             if not row["is_series"]:
                 self._sync(c, row, ev)  # still there, just moved outside the next two weeks
+            elif row["status"] == "pending" and series_ended(ev, self.now):
+                if not self.dry_run and self.state.watch_set_if(row["id"], "pending", status="expired",
+                                                                decided_at=self.now.isoformat(), review=None):
+                    self._edit_card_after_removal(row, "Its last occurrence has passed; nothing was added.")
+            elif row["status"] == "tracked" and not self.dry_run:
+                self._sync_copies(row, [])  # no occurrence in the window any more: upcoming copies go
             return
+        snap = json.loads(row["snapshot"])
+        misses = snap.get("missing", 0) + 1
+        if misses < 2:
+            if not self.dry_run:
+                self.state.watch_set(row["id"], snapshot={**snap, "missing": misses})
+            return  # a subscribed feed can come back empty for one refresh; wait for a second scan
         title = row["title"]
         self.stats["gone"] += 1
         if self.dry_run:
             print(f"WOULD NOTE CANCELLED ({c['label']}): {title}", flush=True)
             return
-        self.state.watch_set(row["id"], status="gone", decided_at=self.now.isoformat(), review=None)
-        if row["status"] == "tracked" and row["copy_id"]:
-            google_writer.delete_event(self.cal, self.college, row["copy_id"])
+        snap.pop("missing", None)
+        snap["before_gone"] = row["status"]  # so it can be put back if it reappears
+        if not self.state.watch_set_if(row["id"], row["status"], status="gone", snapshot=snap,
+                                       decided_at=self.now.isoformat(), review=None):
+            return  # decided on a card while this scan ran
+        if row["status"] == "tracked":
+            self._remove_copies(row)
             self._cancelled(c, row, "its copy was removed from College")
         elif row["status"] == "deadline":
             self._cancelled(c, row, "your deadline is still there; delete it if the deadline was dropped")
-        elif row["status"] == "pending" and row["tg_message_id"] and not row["batch"]:
-            self.tg.edit(row["tg_message_id"], card_text(c["label"], row) + f"\n\nCancelled on {c['label']}.")
+        elif row["status"] == "pending":
+            self._edit_card_after_removal(row, f"Cancelled on {c['label']}.")
+
+    def _revive(self, c, row, ev):
+        """An event marked cancelled is back (e.g. the feed was briefly empty): put it back as it was."""
+        snap = json.loads(row["snapshot"])
+        before = snap.pop("before_gone", "pending")
+        snap.pop("missing", None)
+        if self.dry_run:
+            print(f"WOULD RESTORE ({c['label']}): {row['title']}", flush=True)
+            return
+        status = "pending" if before in ("tracked", "pending", "linked") else before
+        self.state.watch_set(row["id"], status=status, snapshot=snap, start=_start_value(ev), decided_at=None,
+                             review="new" if status == "pending" and before != "tracked" and self.review_mode else None)
+        self.stats["back"] += 1
+        if before == "tracked" and self.track(self.state.watch_row(row["id"])):
+            self.notes.append(f"- {row['title']} is back on {c['label']}; copied into College again.")
+
+    def _edit_card_after_removal(self, row, text):
+        if not row["tg_message_id"] or row["batch"] or self.dry_run:
+            return
+        others = [r for r in self.state.watch_rows(message_id=row["tg_message_id"], statuses=["pending"])
+                  if r["id"] != row["id"]]
+        if others:  # the course's other weekly slot is still waiting: keep its buttons
+            self.tg.edit(row["tg_message_id"], card_text(self._label(row["cal_id"]), others),
+                         card_buttons(others[0], json.loads(others[0]["snapshot"]).get("deadline_like")))
+        else:
+            self.tg.edit(row["tg_message_id"], card_text(self._label(row["cal_id"]), row) + f"\n\n{text}")
 
     def _expire(self):
         for row in self.state.watch_rows(statuses=["pending"]):
+            if row["is_series"]:
+                continue  # a series only expires once its last occurrence has passed (_check_gone)
             if self._row_start(row) < self.now:
-                self.state.watch_set(row["id"], status="expired", decided_at=self.now.isoformat(), review=None)
-                if row["tg_message_id"] and not row["batch"] and not self.dry_run:
-                    self.tg.edit(row["tg_message_id"], card_text(self._label(row["cal_id"]), row)
-                                 + "\n\nThe event has passed; nothing was added.")
+                if self.dry_run or not self.state.watch_set_if(row["id"], "pending", status="expired",
+                                                               decided_at=self.now.isoformat(), review=None):
+                    continue
+                if row["tg_message_id"] and not row["batch"]:
+                    self._edit_card_after_removal(row, "The event has passed; nothing was added.")
 
     def _get(self, cal_id, event_id):
         try:
@@ -431,30 +666,63 @@ class Watcher:
             raise
 
     # --- decisions (buttons) ------------------------------------------------------------------------
+    # Each re-reads the row first, so a second tap (or a tap on an old card) never makes a second copy,
+    # and switching between Track / Deadline / Ignore removes whatever the previous choice created.
 
-    def track(self, row):
-        """Copies the event (or the whole series) into College. Returns False if it no longer exists."""
+    def _remove_copies(self, row):
+        """Deletes a tracked row's College copy, or a series' upcoming copies (past ones stay as history)."""
+        if row["copy_id"]:
+            if row["is_series"]:
+                google_writer.end_series_copy(self.cal, self.college, row["copy_id"], self.now)
+            else:
+                google_writer.delete_event(self.cal, self.college, row["copy_id"])
+        for cp in self.state.series_copies(row["id"]):
+            if cp["copy_id"] and self._row_start({"start": cp["start"]}) > self.now:
+                google_writer.delete_event(self.cal, self.college, cp["copy_id"])
+            self.state.series_copy_delete(row["id"], cp["instance_key"])
+
+    def track(self, row, instances=None):
+        """Copies the event (or a series' upcoming occurrences) into College. Returns False if it no longer exists."""
+        row = self._fresh(row)
+        if row["status"] == "tracked":
+            return True
         source = self._get(row["cal_id"], row["event_key"])
         if source is None or source.get("status") == "cancelled":
             self.state.watch_set(row["id"], status="gone", decided_at=self.now.isoformat())
             return False
-        copy_id = google_writer.create_copy(self.cal, self.college, source, self._label(row["cal_id"]),
-                                            f"{row['cal_id']}|{row['event_key']}")
-        self.state.watch_set(row["id"], status="tracked", copy_id=copy_id, decided_at=self.now.isoformat())
+        if row["status"] == "deadline" and row["copy_id"]:
+            _remove_deadline(self, row)
+        if row["is_series"]:
+            self.state.watch_set(row["id"], status="tracked", copy_id=None, decided_at=self.now.isoformat())
+            if instances is None:
+                instances = google_writer.list_instances(self.cal, row["cal_id"], row["event_key"], self.now, self.horizon)
+            self._sync_copies(self.state.watch_row(row["id"]), instances)
+        else:
+            copy_id = google_writer.create_copy(self.cal, self.college, source, self._label(row["cal_id"]),
+                                                f"{row['cal_id']}|{row['event_key']}")
+            self.state.watch_set(row["id"], status="tracked", copy_id=copy_id, decided_at=self.now.isoformat())
         self.stats["tracked"] += 1
         return True
 
     def ignore(self, row):
-        """Ignore it; if it was tracked, its College copy is removed."""
-        if row["status"] == "tracked" and row["copy_id"]:
-            google_writer.delete_event(self.cal, self.college, row["copy_id"])
+        """Ignore it; its College copy, or a deadline made from it, is removed."""
+        row = self._fresh(row)
+        if row["status"] == "tracked":
+            self._remove_copies(row)
+        elif row["status"] == "deadline" and row["copy_id"]:
+            _remove_deadline(self, row)
         self.state.watch_set(row["id"], status="ignored", copy_id=None, decided_at=self.now.isoformat())
 
     def as_deadline(self, row):
         """Makes it a deadline (DUE event + task), like an Added deadline card from an email."""
+        row = self._fresh(row)
+        if row["status"] == "deadline" and row["copy_id"]:
+            return row["copy_id"]
         ev = self._get(row["cal_id"], row["event_key"])
-        if ev is None:
+        if ev is None or ev.get("status") == "cancelled":
             return None
+        if row["status"] == "tracked":
+            self._remove_copies(row)
         due = due_of(ev, self.tz)
         item = {"type": "deadline", "title": clean_text(row["title"]) or "Deadline", "start": due - timedelta(minutes=30),
                 "end": due, "all_day": False, "due": due, "course": None, "location": None, "description": None,
@@ -539,6 +807,8 @@ def _remove_deadline(w, row):
 
 
 def _save_undo(state, record):
+    """record: {cal_id, policy (previous override or None), rows: [[id, status, copy_id, review]], after: the status
+    the press gave the rows, policy_after: the override it set}. Undo only restores what is still that way."""
     n = int(state.get_meta("calundo_seq") or 0) + 1
     state.set_meta("calundo_seq", str(n))
     state.set_meta(f"calundo:{n}", json.dumps(record))
@@ -547,25 +817,34 @@ def _save_undo(state, record):
 
 def _undo(w, n):
     """Puts rows (and the calendar's setting) back as they were before one button press, removing any
-    copies or deadlines that press created. Returns the restored row ids, or None if already undone."""
+    copies or deadlines that press created. Rows you've decided differently since are left alone.
+    Returns the restored row ids, or None if already undone."""
     raw = w.state.get_meta(f"calundo:{n}")
     if not raw:
         return None
     rec = json.loads(raw)
     if rec.get("policy") is not None:
         key = w.by_id[rec["cal_id"]]["key"] if rec["cal_id"] in w.by_id else rec["cal_id"]
-        w.state.set_meta(f"calpolicy:{key}", rec["policy"])  # "" = back to what config.yaml says
+        if "policy_after" not in rec or (w.state.get_meta(f"calpolicy:{key}") or "") == rec["policy_after"]:
+            w.state.set_meta(f"calpolicy:{key}", rec["policy"])  # "" = back to what config.yaml says
+    restored = []
     for entry in rec["rows"]:
         row_id, status, copy_id = entry[:3]
         row = w.state.watch_row(row_id)
-        if row["status"] == "tracked" and row["copy_id"] and row["copy_id"] != copy_id:
-            google_writer.delete_event(w.cal, w.college, row["copy_id"])
+        if rec.get("after") and row["status"] != rec["after"]:
+            continue  # changed since (e.g. you tapped Track now on it later): leave your newer choice
+        if row["status"] == "tracked" and (status != "tracked" or row["copy_id"] != copy_id):
+            w._remove_copies(row)  # the copies (or a series' occurrence copies) this press made
         elif row["status"] == "deadline" and row["copy_id"]:
             _remove_deadline(w, row)
-        w.state.watch_set(row_id, status=status, copy_id=copy_id, decided_at=None,
+        w.state.watch_set(row_id, status="pending" if status == "tracked" else status,
+                          copy_id=None if status == "tracked" else copy_id, decided_at=None,
                           **({"review": entry[3]} if len(entry) > 3 else {}))
+        if status == "tracked":
+            w.track(w.state.watch_row(row_id))
+        restored.append(row_id)
     w.state.set_meta(f"calundo:{n}", "")  # one Undo per press
-    return [r[0] for r in rec["rows"]]
+    return restored
 
 
 def _snapshot_rows(rows):
@@ -575,7 +854,8 @@ def _snapshot_rows(rows):
 def handle_callback(listener, cq, action, rest, now):
     """cal:<op>:<row>  one event        calb:<op>:<batch>  summary card     cale:<row>:<hours>  deadline effort
     calc:<op>:<ref>  confirm/cancel a calendar-wide change (ref = r<row> or b<batch>)
-    calu:<n>         undo                                  calp:<index>  /calendars menu"""
+    calu:<n>         undo                                  calp:<index>  /calendars menu
+    The listener has already answered the tap; results show by editing the message."""
     w = Watcher(listener.cfg, listener.state, listener.calendar, listener.tasks, listener.tg, now)
     tg, state, message_id = listener.tg, listener.state, cq["message"]["message_id"]
     log.info("calendar button %s:%s", action, rest)
@@ -586,8 +866,7 @@ def handle_callback(listener, cq, action, rest, now):
     if action == "calu":
         restored = _undo(w, int(rest)) if rest.isdigit() else None
         if restored is None:
-            tg.edit(message_id, "Already undone.")
-            return
+            return  # a second tap: the message already shows the restored state; don't wipe it
         _rerender(w, restored)
         log.info("undid calendar change %s (%d events restored)", rest, len(restored))
         return
@@ -606,6 +885,7 @@ def handle_callback(listener, cq, action, rest, now):
         key = w.by_id[cal_id]["key"] if cal_id in w.by_id else cal_id
         before = state.watch_rows(cal_id=cal_id, statuses=["pending"])
         undo = _save_undo(state, {"cal_id": cal_id, "policy": state.get_meta(f"calpolicy:{key}") or "",
+                                  "policy_after": policy, "after": "tracked" if policy == "copy" else "ignored",
                                   "rows": _snapshot_rows(before)})
         _apply_policy_to_calendar(w, cal_id, policy, skip_message=message_id)
         label_ = w._label(cal_id)
@@ -634,7 +914,8 @@ def handle_callback(listener, cq, action, rest, now):
                     + (f" {left} more are waiting; tap One by one again." if left > 0 else ""),
                     [[("One by one", f"calb:o:{raw}")]] if left > 0 else None)
             return
-        undo = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None, "rows": _snapshot_rows(rows)})
+        undo = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None,
+                                  "after": "tracked" if op == "t" else "ignored", "rows": _snapshot_rows(rows)})
         if op == "t":
             done = sum(1 for r in rows if w.track(r))
             tg.edit(message_id, f"{c_label}: tracked {done} event(s); copied into College.", [[("Undo", f"calu:{undo}")]])
@@ -647,7 +928,7 @@ def handle_callback(listener, cq, action, rest, now):
     if action == "cale":  # effort for a deadline made from a calendar event
         raw_id, _, hours = rest.partition(":")
         row = state.watch_row(int(raw_id)) if raw_id.isdigit() else None
-        if not row or not row["copy_id"]:
+        if not row or not row["copy_id"] or row["status"] != "deadline":
             return
         state.set_effort(f"event:{row['copy_id']}", float(hours))
         tg.edit(message_id, _decided_text(w, row, f"Added as a deadline. Work needed: {float(hours):g} h"))
@@ -657,20 +938,28 @@ def handle_callback(listener, cq, action, rest, now):
     row = state.watch_row(int(raw_id)) if raw_id.isdigit() else None
     if row is None:
         return
+    on_card = _card_rows(state, row, message_id)
     if op == "t":
-        group = siblings(state, row, ["pending", "ignored"])
-        ok = [w.track(r) for r in group]
-        tg.edit(message_id, _decided_text(w, group, "Tracked: copied into College." if any(ok) else
+        group = [r for r in on_card if r["status"] in ("pending", "ignored", "deadline")]
+        if not group and row["status"] == "tracked":  # a second tap: nothing more to copy
+            group, ok = [r for r in on_card if r["status"] == "tracked"], [True]
+        else:
+            ok = [w.track(r) for r in group]
+        tg.edit(message_id, _decided_text(w, group or [row], "Tracked: copied into College." if any(ok) else
                                           "That event no longer exists; nothing was added."),
                 [[("Untrack", f"cal:u:{row['id']}")]] if any(ok) else None)
     elif op in ("i", "u"):
-        group = siblings(state, row, ["pending", "tracked"])
+        group = [r for r in on_card if r["status"] in (("tracked",) if op == "u" else ("pending", "tracked", "deadline"))]
         for r in group:
             w.ignore(r)
-        tg.edit(message_id, _decided_text(w, group, "Untracked: the College copy was removed." if op == "u" else "Ignored."),
+        tg.edit(message_id, _decided_text(w, group or [row], "Untracked: the College copy was removed." if op == "u"
+                                          else "Ignored."),
                 [[("Track instead", f"cal:t:{row['id']}")]])
     elif op == "d":
-        undo = _save_undo(state, {"cal_id": row["cal_id"], "policy": None, "rows": _snapshot_rows([row])})
+        if row["status"] == "deadline":  # a second tap
+            return
+        undo = _save_undo(state, {"cal_id": row["cal_id"], "policy": None, "after": "deadline",
+                                  "rows": _snapshot_rows([row])})
         if w.as_deadline(row) is None:
             tg.edit(message_id, _decided_text(w, row, "That event no longer exists; nothing was added."))
         else:
@@ -730,9 +1019,15 @@ OUTCOME = {"tracked": "tracked", "ignored": "ignored", "deadline": "deadline", "
 SECTION = {"new": "New", "changed": "Changed", "cancelled": "Cancelled", "copied": "Copied automatically"}
 
 
-def daily_review(cfg, state, cal, tasks_api, tg, now):
+def daily_review(cfg, state, cal, tasks_api, tg, now, wait_s=180):
     """One message with everything new, changed or cancelled on your calendars since the last review, with
-    Track / Ignore (or Keep / Remove) per item. Returns True if there was anything to send."""
+    Track / Ignore (or Keep / Remove) per item. Returns True if there was anything to send. Raises WatchBusy
+    if another calendar scan kept running (the caller tries again later)."""
+    with watch_lock(wait_s):
+        return _daily_review(cfg, state, cal, tasks_api, tg, now)
+
+
+def _daily_review(cfg, state, cal, tasks_api, tg, now):
     w = Watcher(cfg, state, cal, tasks_api, tg, now)
     w.run()  # a fresh look first; non-urgent findings are only queued by it
     waiting = state.watch_rows(review=True)
@@ -747,8 +1042,11 @@ def daily_review(cfg, state, cal, tasks_api, tg, now):
     if not items:
         return False
     n = int(state.get_meta("review_seq") or 0) + 1
-    state.set_meta("review_seq", str(n))
     record = {"items": items, "date": now.date().isoformat()}
+    text, buttons = render_review(w, n, record)
+    # Send first: nothing is marked until the message is out, so a failed send loses no news and is retried.
+    record["message_id"] = tg.send(text, buttons)
+    state.set_meta("review_seq", str(n))
     state.set_meta(f"review:{n}", json.dumps(record))
     for kind, ids in items:
         for i in ids:  # cancelled / copied are just news: shown once
@@ -756,11 +1054,8 @@ def daily_review(cfg, state, cal, tasks_api, tg, now):
     previous = state.get_meta("review_last")
     old = json.loads(state.get_meta(f"review:{previous}") or "{}") if previous else {}
     still_open = any(_item_open(k, state.watch_row(ids[0])) for k, ids in old.get("items", []) if k in ("new", "changed"))
-    if old.get("message_id") and still_open:  # its open items move to the new review
+    if old.get("message_id") and still_open:  # its open items moved to the new review (a deleted one is fine)
         tg.edit(old["message_id"], "This review was replaced by a newer one below.")
-    text, buttons = render_review(w, n, record)
-    record["message_id"] = tg.send(text, buttons)
-    state.set_meta(f"review:{n}", json.dumps(record))
     state.set_meta("review_last", str(n))
     return True
 
@@ -844,11 +1139,13 @@ def handle_review(listener, cq, action, rest, now):
             return
         if op == "o":
             for g in group_rows(rows)[:MAX_ONE_BY_ONE]:
+                w._send_card(g)  # sent first: if it fails, the item is still in the review
                 for r in g:
                     state.watch_set(r["id"], review=None)
-                w._send_card(g)
         else:
-            record["undo"] = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None, "rows": _snapshot_rows(rows)})
+            record["undo"] = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None,
+                                                "after": "tracked" if op == "t" else "ignored",
+                                                "rows": _snapshot_rows(rows)})
             state.set_meta(f"review:{n}", json.dumps(record))
             for r in rows:
                 w.track(r) if op == "t" else w.ignore(r)
@@ -861,6 +1158,8 @@ def handle_review(listener, cq, action, rest, now):
         return
     group = _review_item(state, row)
     if op == "d":
+        if row["status"] == "deadline":
+            return  # a second tap
         if w.as_deadline(row) is not None:
             fresh = state.watch_row(row["id"])
             choices = [(f"{h:g} h", f"cale:{row['id']}:{h}") for h in listener.cfg["planner"]["effort_choices_hours"]]
@@ -911,12 +1210,14 @@ def _menu_buttons(menu):
 
 def _cycle_policy(w, cq, raw_index):
     ids = json.loads(w.state.get_meta("calendars_menu") or "[]")
+    message_id = cq["message"]["message_id"]
     if not raw_index.isdigit() or int(raw_index) >= len(ids) or ids[int(raw_index)] not in w.by_id:
-        w.tg.answer(cq["id"], "Menu is out of date; send /calendars again")
+        w.tg.edit(message_id, "This menu is out of date; send /calendars again.")
         return
     c = w.by_id[ids[int(raw_index)]]
     new = POLICIES[(POLICIES.index(c["policy"]) + 1) % len(POLICIES)] if c["policy"] in POLICIES else "ask"
     w.set_policy(c["id"], new)
     menu = [w.by_id[i] for i in ids if i in w.by_id]
-    w.tg.edit(cq["message"]["message_id"], _menu_text(menu), _menu_buttons(menu))
-    w.tg.answer(cq["id"], f"{c['label'][:30]}: {new}")
+    w.tg.edit(message_id, _menu_text(menu), _menu_buttons(menu))
+
+

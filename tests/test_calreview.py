@@ -1,4 +1,5 @@
 """The daily calendar review: non-urgent findings wait for one message; changes are asked about again."""
+import itertools
 import copy
 from types import SimpleNamespace
 
@@ -33,9 +34,12 @@ def review(s, now=NOW):
     return calwatch.daily_review(CFG, s.db, s.cal, s.tasks, s.tg, now)
 
 
+TAP_IDS = itertools.count(1)
+
+
 def tap(s, data, message_id=None):
     action, _, rest = data.partition(":")
-    cq = {"id": "cb", "data": data, "message": {"message_id": message_id or 999}}
+    cq = {"id": f"cb{next(TAP_IDS)}", "data": data, "message": {"message_id": message_id or 999}}
     if action in ("crv", "crva"):
         calwatch.handle_review(s.listener, cq, action, rest, NOW)
     else:
@@ -90,10 +94,10 @@ def test_track_all_new_and_undo(s):
     review(s)
     msg = last_review(s)
     tap(s, "crva:t:1")
-    assert len(s.cal.inserted) == 8                                        # 7 contests + the tutorial series
+    assert len(s.cal.inserted) == 9                                        # 7 contests + 2 upcoming tutorials
     undo = next(b for b in buttons_of(edited(s, msg)) if b[0] == "Undo")
     tap(s, undo[1])
-    assert len(s.cal.deleted) == 8
+    assert len(s.cal.deleted) == 9
     assert row(s, TLE, "c0")["status"] == "pending" and row(s, TLE, "c0")["review"] == "new"
     assert ("Track all new", "crva:t:1") in buttons_of(edited(s, msg))
 
@@ -107,7 +111,7 @@ def test_changed_tracked_event_is_updated_then_asked(s):
     s.cal.masters[OUTLOOK]["s1"]["start"] = {"dateTime": h(27).isoformat()}
     s.cal.masters[OUTLOOK]["s1"]["end"] = {"dateTime": h(28).isoformat()}
     watch(s)
-    assert s.cal.patched and s.cal.patched[-1][2]["start"]["dateTime"] == h(27).isoformat()   # copy updated at once
+    assert any(p[2]["start"]["dateTime"] == h(27).isoformat() for p in s.cal.patched)    # copies updated at once
     assert row(s, OUTLOOK, "s1")["review"] == "changed"
     review(s)
     msg = last_review(s)
@@ -152,6 +156,7 @@ def test_cancelled_tracked_event_is_news_in_the_review(s):
     copy_id = row(s, TLE, "c2")["copy_id"]
     del s.cal.evs[TLE][2]
     watch(s)
+    watch(s)                                                                          # gone on two scans in a row
     assert (COLLEGE, copy_id) in s.cal.deleted and row(s, TLE, "c2")["review"] == "cancelled"
     review(s)
     assert "\nCancelled\n- Codeforces Round 902 (TLE Contest Tracker): its copy was removed from College" in last_review(s)["text"]

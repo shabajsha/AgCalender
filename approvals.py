@@ -5,22 +5,28 @@
 ingest.py calls ask() for each new item. This listener long-polls Telegram (near-zero CPU while idle),
 creates the items you approve, marks the ones you skip, and expires items whose date has passed.
 After `approval.learn_after_skips` skips (and no adds) from one sender, it offers to stop asking about them.
-It also answers commands (only from your chat): /todo, /check, /plan, /clear, /pause, /resume, /status, the same
-actions from the button bar, and the morning check-in (plain replies become to-dos while it's open).
+It also answers commands (only from your chat): /todo, /check, /skipped, /plan, /clear, /pause, /resume, /status,
+the same actions from the button bar, and the morning check-in (plain replies become to-dos while it's open).
+
+Every tap is answered exactly once: Telegram shows only the first answer, so slow taps (anything that talks to
+Google) are answered straight away and report back by editing their message; quick ones answer with a short note.
 """
 import logging
+import re
 import subprocess
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 
 import alerts
 import calwatch
 import google_writer
+import llm
 import logsetup
 import morning
 import todos
@@ -34,18 +40,26 @@ LOG_DIR = Path(__file__).parent / "logs"
 EXPIRE_EVERY_S = 600
 COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
             ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
+            ("skipped", "Emails I skipped (no deadline words), with a button to read one anyway"),
             ("calendars", "Choose which calendars I ask about, copy, show or ignore"),
             ("review", "Calendar review now: what's new or changed on your calendars"),
             ("plan", "Plan the rest of today (habits + work blocks)"),
-            ("clear", "Remove today's planned blocks"),
-            ("pause", "Stop reading mail until /resume"),
+            ("clear", "Remove today's planned blocks that haven't started"),
+            ("pause", "Stop reading mail until /resume (calendar checks continue)"),
             ("resume", "Start reading mail again (checks right away)"),
-            ("status", "Is mail reading on? Last check, waiting cards")]
+            ("status", "Is everything working? Last checks, login, GPU, waiting cards")]
 # Permanent button bar at the bottom of the chat; each label maps to a command.
 KEYBOARD = [["Check mail now", "Plan rest of today"], ["Status", "Pause", "Resume"]]
 LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "/status",
           "pause": "/pause", "resume": "/resume"}
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
+# Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
+SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo"}
+# Typed instead of tapping the check-in buttons (a whole message, after lowercasing and trimming punctuation).
+DONE_WORDS = {"done", "finished", "that's all", "thats all", "that's it", "thats it", "all done", "ok", "okay"}
+NONE_WORDS = {"nothing", "nothing today", "no", "none", "nope", "no tasks", "nil"}
+ERROR_REPLY_EVERY_S = 60
+SKIPPED_SHOWN = 8
 log = logging.getLogger("approvals")
 
 
@@ -81,10 +95,24 @@ def ask(tg, state, key, item, msg, sender):
 
 
 def _is_past(item, now):
+    if item.get("recurrence"):
+        return False  # a repeating invite that began earlier still has occurrences ahead
     when = _when(item)
     if not isinstance(when, datetime):
         when = datetime.combine(when, dtime(23, 59), now.tzinfo)
     return when < now
+
+
+class Tap:
+    """Answers one button tap exactly once; later answers are ignored (Telegram would drop them anyway)."""
+
+    def __init__(self, tg, callback_id, answered=False):
+        self.tg, self.id, self.done = tg, callback_id, answered
+
+    def answer(self, text=""):
+        if not self.done:
+            self.done = True
+            self.tg.answer(self.id, text)
 
 
 class Listener:
@@ -94,43 +122,68 @@ class Listener:
         self.calendar = build("calendar", "v3", credentials=creds)
         self.tasks = build("tasks", "v1", credentials=creds)
         self.learn_after = cfg.get("approval", {}).get("learn_after_skips", 3)
+        self._last_error_reply = 0.0
+
+    def _tz(self):
+        return ZoneInfo(self.cfg["timezone"])
+
+    def is_mine(self, cq):
+        return cq.get("message", {}).get("chat", {}).get("id") == self.tg.chat_id
+
+    @staticmethod
+    def is_slow(cq):
+        return cq.get("data", "").partition(":")[0] in SLOW_ACTIONS
 
     def handle(self, cq):
-        chat_id = cq.get("message", {}).get("chat", {}).get("id")
-        if chat_id != self.tg.chat_id:
-            log.warning("ignored a tap from unknown chat %s", chat_id)
+        if not self.is_mine(cq):
+            log.warning("ignored a tap from unknown chat %s", cq.get("message", {}).get("chat", {}).get("id"))
             self.tg.answer(cq["id"], "Not allowed")
             return
-        # Answer at once so the button stops spinning; slow Google calls come after. (Answering late made
-        # Telegram reject the tap and let taps pile up behind each other.)
-        self.tg.answer(cq["id"])
+        tap = cq.setdefault("_tap", Tap(self.tg, cq["id"], cq.get("_answered", False)))
+        try:
+            self._route(cq, tap)
+        finally:
+            tap.answer()  # every tap gets an answer, even if the work failed
+
+    def _route(self, cq, tap):
         action, _, rest = cq.get("data", "").partition(":")
+        if action in SLOW_ACTIONS:
+            tap.answer()  # before the slow Google calls; results show by editing the message
         if action in ("crv", "crva"):  # the daily calendar review and "changed" cards
-            calwatch.handle_review(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
+            calwatch.handle_review(self, cq, action, rest, datetime.now(self._tz()))
             return
-        if action in ("cal", "calb", "cale", "calp", "calc", "calu"):  # events from your other calendars (calwatch.py)
-            calwatch.handle_callback(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
+        if action in ("cal", "calb", "cale", "calc", "calu", "calp"):  # events from your other calendars
+            calwatch.handle_callback(self, cq, action, rest, datetime.now(self._tz()))
             return
-        if action == "checkin":  # "checkin:done" / "checkin:none" under the morning question
-            self.checkin_answered(cq, rest)
+        if action == "checkin":  # "checkin:done:<date>" / "checkin:none:<date>" under the morning question
+            self.checkin_answered(cq, tap, rest)
             return
         if action == "undo":  # "undo:<batch>" under a to-do confirmation
             self.undo_todos(cq, rest)
             return
+        if action == "read":  # "read:<gmail id>" under /skipped: run the model on that email after all
+            started = self._run_script("ingest.py", "--message", rest, unit=f"calendar-read-{rest[:16]}")
+            tap.answer("Reading it now; a card follows if there's something to add." if started is True
+                       else "Already reading it." if started == "busy" else "Couldn't start")
+            return
         if action == "clear":  # "clear:<YYYY-MM-DD>" under a plan summary
             started = self._run_planner("--clear", "--date", rest)
-            self.tg.answer(cq["id"], "Clearing..." if started else "Couldn't start")
+            tap.answer("Clearing..." if started is True else "Already busy; try again in a minute"
+                       if started == "busy" else "Couldn't start")
             return
         raw_id, _, arg = rest.partition(":")
         row = self.state.get_pending(int(raw_id)) if raw_id.isdigit() else None
         if row is None:
-            self.tg.answer(cq["id"], "Unknown item")
+            tap.answer("This card is out of date")
             return
         if action == "effort":  # "effort:<pending id>:<hours>"
-            self.effort(row, cq, arg)
+            self.effort(row, cq, tap, arg)
             return
-        {"add": self.add, "skip": self.skip, "block": self.block, "keep": self.keep}.get(
-            action, lambda r, c: self.tg.answer(c["id"], "Unknown button"))(row, cq)
+        handler = {"add": self.add, "skip": self.skip, "block": self.block, "keep": self.keep}.get(action)
+        if handler is None:
+            tap.answer("Unknown button")
+            return
+        handler(row, cq, tap)
 
     def handle_message(self, message):
         if message.get("chat", {}).get("id") != self.tg.chat_id:
@@ -141,41 +194,57 @@ class Listener:
         command = LABELS.get(text.lower()) or (text.split()[0].split("@")[0].lower() if text else "")
         sent_at = message.get("date", time.time())
         if time.time() - sent_at > OFFLINE_AFTER_S and command in ("/check", "/plan", "/clear", "/todo"):
-            stamp = datetime.fromtimestamp(sent_at, ZoneInfo(self.cfg["timezone"]))
+            stamp = datetime.fromtimestamp(sent_at, self._tz())
             self.tg.send(f"Got your {command} from {stamp:%a %H:%M}. The laptop was off or asleep then; doing it now.")
-        today = datetime.now(ZoneInfo(self.cfg["timezone"])).date()
+        today = datetime.now(self._tz()).date()
+        typed = re.sub(r"[^\w' ]+", "", text.lower()).strip()
+        checkin_open = morning.checkin_open(self.state, today)
         if command == "/todo":
             body = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
             if body:
                 self.add_todos(body, today)
             else:
                 self.tg.send("Send /todo followed by the task, one per line, e.g.\n/todo Lab report 2h\nCall bank 15m")
-        elif not text.startswith("/") and not LABELS.get(text.lower()) and morning.checkin_open(self.state, today):
+        elif checkin_open and not text.startswith("/") and (typed in DONE_WORDS or typed in NONE_WORDS):
+            started, reply = self._close_checkin("done" if typed in DONE_WORDS else "none", today)
+            self.tg.send(reply)
+        elif not text.startswith("/") and not LABELS.get(text.lower()) and checkin_open:
             self.add_todos(text, today)
+        elif command == "/skipped":
+            self.show_skipped()
         elif command == "/review":
-            self.tg.send("Looking at your calendars; the review follows shortly."
-                         if self._run_script("morning.py", "--review", unit="calendar-review-now")
-                         else "Couldn't start the calendar review.")
+            started = self._run_script("morning.py", "--review", unit="calendar-review-now")
+            self.tg.send("Looking at your calendars; the review follows shortly." if started is True else
+                         "A calendar review is already running." if started == "busy" else
+                         "Couldn't start the calendar review.")
         elif command == "/calendars":
-            calwatch.show_menu(self, datetime.now(ZoneInfo(self.cfg["timezone"])))
+            calwatch.show_menu(self, datetime.now(self._tz()))
         elif command == "/check":
+            gpu_retry = bool(llm.gpu_lost_since(self.state))
+            llm.clear_gpu_flag(self.state)  # you may have just fixed it (restarted Ollama, left power-saver mode)
             if self.state.paused_since():
-                self.tg.send("Mail reading is paused, so nothing was checked. Tap Resume (or send /resume) first.")
+                self.tg.send("Mail reading is paused, so no mail was read. Tap Resume (or send /resume) first.")
             elif self._start_ingest_now():
-                self.tg.send("Checking mail now. Anything new will arrive here as a card.")
+                self.tg.send("Checking mail now. Anything new will arrive here as a card."
+                             + (" (Trying the GPU again.)" if gpu_retry else ""))
             else:
                 self.tg.send("Couldn't start the mail check (is calendar-ingest.service installed?).")
         elif command == "/plan":
-            self.tg.send("Planning the rest of today; the plan will arrive here shortly."
-                         if self._run_planner() else "Couldn't start the planner.")
+            started = self._run_planner()
+            self.tg.send("Planning the rest of today; the plan will arrive here shortly." if started is True else
+                         "Already planning; the plan will arrive shortly." if started == "busy" else
+                         "Couldn't start the planner.")
         elif command == "/clear":
-            self.tg.send("Clearing today's plan..." if self._run_planner("--clear") else "Couldn't start the planner.")
+            started = self._run_planner("--clear")
+            self.tg.send("Clearing today's plan..." if started is True else
+                         "Already busy with the plan; try again in a minute." if started == "busy" else
+                         "Couldn't start the planner.")
         elif command == "/pause":
             already = self.state.paused_since()
             self.state.set_paused(True)
             self.tg.send("Already paused." if already else
-                         "Paused. I won't read new mail until you send /resume.\n"
-                         "Mail that arrives meanwhile is checked when you resume. Buttons on existing cards still work.")
+                         "Paused. I won't read new mail until you send /resume. Your other calendars are still "
+                         "checked.\nMail that arrives meanwhile is read when you resume. Buttons on existing cards still work.")
             log.info("paused via Telegram")
         elif command == "/resume":
             was_paused = self.state.paused_since()
@@ -192,12 +261,68 @@ class Listener:
                          keyboard=KEYBOARD)
 
     def status_text(self):
-        tz = ZoneInfo(self.cfg["timezone"])
-        paused, last = self.state.paused_since(), self.state.get_last_run()
+        tz, state = self._tz(), self.state
+        now = datetime.now(tz)
+        paused, last = state.paused_since(), state.get_last_run()
+
+        def stamp(iso):
+            return datetime.fromisoformat(iso).astimezone(tz).strftime("%a %d %b %H:%M") if iso else "never"
+
         lines = [f"Mail reading: PAUSED since {paused.astimezone(tz):%a %d %b %H:%M}" if paused else "Mail reading: on (every 30 min)",
                  f"Last mail check: {last.astimezone(tz):%a %d %b %H:%M}" if last else "Last mail check: never",
-                 f"Cards waiting for your answer: {self.state.count_open_pending()}"]
+                 f"Last calendar check: {stamp(state.get_meta('last_calendar_scan'))}",
+                 f"Morning routine: {'done today' if state.get_meta(morning.MORNING_SENT) == now.date().isoformat() else 'not yet today'}",
+                 "Google login: " + ("EXPIRED - run auth.py in a terminal" if state.get_meta("alert:auth") else "OK")]
+        lost = llm.gpu_lost_since(state)
+        lines.append(f"GPU for the model: unavailable since {lost.astimezone(tz):%a %H:%M} (emails wait; send /check after fixing)"
+                     if lost else "GPU for the model: OK")
+        waiting = int(state.get_meta("llm_waiting") or 0)
+        if waiting:
+            lines.append(f"Emails waiting for the model: {waiting}")
+        lines.append(f"Cards waiting for your answer: {state.count_open_pending()}")
+        skipped = state.skipped_messages(limit=50, since=now - timedelta(days=1))
+        if skipped:
+            lines.append(f"Emails skipped in the last 24 h (no deadline words): {len(skipped)} - /skipped")
+        problems = []
+        for key, value in state.db.execute("SELECT key, value FROM meta WHERE key LIKE 'alert:%' AND value != ''"):
+            when = datetime.fromisoformat(value)
+            if now - when < timedelta(days=1) and key != "alert:auth":
+                problems.append(f"- {key[len('alert:'):]} at {when.astimezone(tz):%a %H:%M}")
+        lines += (["Problems in the last 24 h:"] + problems) if problems else ["Problems in the last 24 h: none"]
+        lines.append(f"Last database backup: {stamp(state.get_meta('last_backup'))}")
         return "\n".join(lines)
+
+    def show_skipped(self):
+        rows = self.state.skipped_messages(limit=SKIPPED_SHOWN)
+        if not rows:
+            self.tg.send("No skipped emails recently. (Emails without deadline words are listed here.)")
+            return
+        tz = self._tz()
+        lines = ["Emails I didn't send to the model (no deadline words), newest first:"]
+        buttons = []
+        for n, r in enumerate(rows, 1):
+            when = datetime.fromisoformat(r["processed_at"]).astimezone(tz)
+            why = " (the model's answer was unreadable)" if r["outcome"] == "unreadable" else ""
+            lines.append(f"{n}. {when:%a %d %b}: {r['subject'][:80]}{why}")
+            buttons.append((f"Read {n}", f"read:{r['msg_id']}"))
+        lines.append("\nTap Read <n> if one has a deadline or event; I'll ask the model about it.")
+        self.tg.send("\n".join(lines), [buttons[i:i + 4] for i in range(0, len(buttons), 4)])
+
+    def report_error(self, exc):
+        """A tap or command failed: say so instead of leaving the card unchanged."""
+        if isinstance(exc, (RefreshError, AuthExpired)):
+            alerts.alert("auth", alerts.AUTH_TEXT, self.state)
+            text = "That didn't work: the Google login has expired. " + alerts.AUTH_TEXT.split("Fix: ")[-1]
+        elif alerts.is_offline_error(exc):
+            text = "Couldn't reach Google just now, so that didn't happen. Try again in a minute."
+        else:
+            text = f"Sorry, that didn't work ({type(exc).__name__}). Details are in logs/approvals.log."
+        if time.time() - self._last_error_reply >= ERROR_REPLY_EVERY_S:
+            self._last_error_reply = time.time()
+            try:
+                self.tg.send(text)
+            except TelegramError:
+                pass
 
     @staticmethod
     def _start_ingest_now():
@@ -218,7 +343,7 @@ class Listener:
         lines = [f"- {title} ({todos.fmt_minutes(m)})" for title, m in added]
         buttons = [("Undo", f"undo:{batch}")]
         if morning.checkin_open(self.state, today):
-            tail, buttons = "Anything else? Tap Done when you're finished.", buttons + [("Done", "checkin:done")]
+            tail, buttons = "Anything else? Tap Done (or type done) when you're finished.", buttons + [morning.checkin_buttons(today)[0]]
         else:
             tail = "Tap 'Plan rest of today' to fit it into today's plan."
         self.tg.send("Added to DAILY TASKS (due today):\n" + "\n".join(lines) + "\n\n" + tail, buttons)
@@ -226,39 +351,64 @@ class Listener:
 
     def undo_todos(self, cq, raw_batch):
         if not raw_batch.isdigit():
-            self.tg.answer(cq["id"], "Unknown button")
             return
         removed = todos.undo(self.tasks, self.cfg["morning"]["todo_tasklist"], self.state, int(raw_batch))
         self.tg.edit(cq["message"]["message_id"], ("Removed: " + ", ".join(removed)) if removed else "Already removed.")
-        self.tg.answer(cq["id"], "Undone")
 
-    def checkin_answered(self, cq, answer):
-        today = datetime.now(ZoneInfo(self.cfg["timezone"])).date()
+    def _close_checkin(self, answer, today):
+        """Done / Nothing today (tapped or typed): plan the day now. Returns (started, reply)."""
         self.state.set_meta(morning.CHECKIN_ANSWERED, today.isoformat())
         if self.state.get_meta(morning.MORNING_SENT) == today.isoformat():
-            started, msg = self._run_planner(), "Re-planning the rest of today with your to-dos."
+            started = self._run_planner()
+            if started == "busy":
+                self.state.set_meta("replan_requested", "1")  # the running planner plans again when it's done
+                started = True
+            reply = "Re-planning the rest of today with your to-dos."
         else:
-            started, msg = (self._run_script("morning.py", "--finish", unit="calendar-morning-now"),
-                            "Got it. Planning your day now; the morning message follows shortly.")
-        self.tg.edit(cq["message"]["message_id"], msg if started else "Couldn't start the planner.")
-        self.tg.answer(cq["id"], "Planning..." if started else "Error")
+            started = self._run_script("morning.py", "--finish", unit="calendar-morning-now")
+            reply = "Got it. Planning your day now; the morning message follows shortly."
+            if started == "busy":
+                started, reply = True, "Got it. The morning plan is already being made; it follows shortly."
         log.info("check-in answered (%s)", answer)
+        return started is True, reply if started is True else "Couldn't start the planner."
+
+    def checkin_answered(self, cq, tap, rest):
+        answer, _, day = rest.partition(":")
+        today = datetime.now(self._tz()).date()
+        message_id = cq["message"]["message_id"]
+        sent = self.state.get_meta(morning.CHECKIN_SENT) or ""
+        # Old buttons (another day's check-in, or a to-do reply from yesterday) must not start today's morning.
+        stale = (day and day != today.isoformat()) or (not day and not morning.checkin_open(self.state, today))
+        if stale:
+            self.tg.edit(message_id, f"That was the check-in for {day or 'an earlier day'}; nothing was changed. "
+                                     "Tap 'Plan rest of today' to plan now.")
+            tap.answer("Old button")
+            return
+        if sent[:10] != today.isoformat() and self.state.get_meta(morning.MORNING_SENT) != today.isoformat():
+            tap.answer("Today's check-in hasn't started yet")
+            return
+        started, reply = self._close_checkin(answer, today)
+        self.tg.edit(message_id, reply)
+        tap.answer("Planning..." if started else "Error")
 
     @classmethod
     def _run_planner(cls, *args):
-        return cls._run_script("planner.py", *args, unit="calendar-plan-now")
+        return cls._run_script("planner.py", *args, unit="calendar-clear-now" if "--clear" in args else "calendar-plan-now")
 
     @staticmethod
     def _run_script(script, *args, unit=None):
         """Starts a script as its own transient systemd unit, so restarting this listener can't kill it.
-        A fixed unit name means a second tap while it's still running is refused instead of doubling up."""
+        A fixed unit name means a second tap while it's still running is refused instead of doubling up.
+        Returns True (started), "busy" (that unit is still running) or False (couldn't start)."""
         here = Path(__file__).parent
         cmd = ["systemd-run", "--user", "--no-block", "--collect", f"--working-directory={here}",
                *([f"--unit={unit}"] if unit else []), sys.executable, str(here / script), *args]
         try:
             done = subprocess.run(cmd, timeout=15, capture_output=True, text=True)
-            if done.returncode == 0 or "already" in done.stderr:  # "... already exists": it's running right now
+            if done.returncode == 0:
                 return True
+            if "already" in done.stderr:  # "... already exists": that unit is running right now
+                return "busy"
         except (OSError, subprocess.TimeoutExpired):
             pass
         try:  # no systemd user session (e.g. run by hand): plain background process
@@ -271,10 +421,9 @@ class Listener:
     def _card(self, row):
         return format_item(row["item"], row["msg_subject"], row["sender"])
 
-    def add(self, row, cq):
+    def add(self, row, cq, tap):
         if row["status"] != "pending":
-            self.tg.answer(cq["id"], f"Already {row['status']}")
-            return
+            return  # a second tap: the card already says what happened
         item, msg = row["item"], {"id": row["msg_id"], "subject": row["msg_subject"]}
         event_id, task_id = google_writer.create_item(self.calendar, self.tasks, self.cfg, item, msg)
         self.state.record_item(row["dedupe_key"], item["type"], event_id, task_id, item["title"],
@@ -288,37 +437,38 @@ class Listener:
                          [choices[:3], choices[3:]] if len(choices) > 3 else choices)
         else:
             self.tg.edit(row["tg_message_id"], text)
-        self.tg.answer(cq["id"], "Added")
         log.info("added %r", item["title"])
 
-    def effort(self, row, cq, arg):
+    def effort(self, row, cq, tap, arg):
         try:
             hours = float(arg)
         except ValueError:
-            self.tg.answer(cq["id"], "Unknown button")
+            tap.answer("Unknown button")
             return
         event_id = self.state.event_id_for(row["dedupe_key"])
         if not event_id:
-            self.tg.answer(cq["id"], "Add it first")
+            tap.answer("Add it first")
             return
         self.state.set_effort(f"event:{event_id}", hours)
         self.tg.edit(row["tg_message_id"], self._card(row) + f"\n\nAdded to your calendar and tasks\n"
                      f"Work needed: {hours:g} h (send /plan to re-plan today with it)")
-        self.tg.answer(cq["id"], f"{hours:g} h")
+        tap.answer(f"{hours:g} h")
         log.info("effort for %r set to %g h", row["item"]["title"], hours)
 
-    def skip(self, row, cq):
+    def skip(self, row, cq, tap):
         if row["status"] != "pending":
-            self.tg.answer(cq["id"], f"Already {row['status']}")
+            tap.answer(f"Already {row['status']}")
             return
         self.state.set_pending_status(row["id"], "skipped")
         self.tg.edit(row["tg_message_id"], self._card(row) + "\n\nSkipped")
-        self.tg.answer(cq["id"], "Skipped")
+        tap.answer("Skipped")
         log.info("skipped %r", row["item"]["title"])
         self._maybe_offer_block(row)
 
     def _maybe_offer_block(self, row):
         sender = row["sender"]
+        if not sender or sender == "unknown":
+            return  # emails whose sender couldn't be read must never be blocked as a group
         added, skipped = self.state.sender_counts(sender)
         if skipped >= self.learn_after and added == 0 and self.state.get_sender_pref(sender) is None:
             self.state.set_sender_pref(sender, "asked")
@@ -326,19 +476,19 @@ class Listener:
                          "Stop asking about their emails?",
                          [("Always skip", f"block:{row['id']}"), ("Keep asking", f"keep:{row['id']}")])
 
-    def block(self, row, cq):
+    def block(self, row, cq, tap):
         self.state.set_sender_pref(row["sender"], "blocked")
         self.tg.edit(cq["message"]["message_id"], f"OK - emails from {row['sender']} will be skipped from now on.")
-        self.tg.answer(cq["id"], "Blocked")
+        tap.answer("Blocked")
         log.info("blocked sender %s", row["sender"])
 
-    def keep(self, row, cq):
+    def keep(self, row, cq, tap):
         self.state.set_sender_pref(row["sender"], "keep")
         self.tg.edit(cq["message"]["message_id"], f"OK - I'll keep asking about emails from {row['sender']}.")
-        self.tg.answer(cq["id"], "OK")
+        tap.answer("OK")
 
     def expire_old(self):
-        now = datetime.now(ZoneInfo(self.cfg["timezone"]))
+        now = datetime.now(self._tz())
         for row in self.state.open_pending():
             if _is_past(row["item"], now):
                 self.state.set_pending_status(row["id"], "expired")
@@ -356,19 +506,35 @@ def main():
         alerts.alert("auth", alerts.AUTH_TEXT)
         time.sleep(600)  # systemd restarts us afterwards; waiting keeps that from happening every 30 s
         raise SystemExit(1)
+    except Exception as e:
+        if not alerts.is_offline_error(e):
+            raise
+        log.warning("no network yet (%s); systemd will start me again in 30 s", type(e).__name__)
+        raise SystemExit(1) from None
     try:
         listener.tg.set_commands(COMMANDS)
     except TelegramError as e:
         log.warning("could not register bot commands: %s", e)
     log.info("listening for taps and commands: %s (Ctrl+C to stop)", " ".join("/" + c for c, _ in COMMANDS))
-    offset, last_expire = None, 0.0
+    offset, last_expire, offline_since = None, 0.0, None
     while True:
         try:
             updates = listener.tg.updates(offset)
+            if offline_since:
+                log.info("Telegram reachable again after %d min", (time.time() - offline_since) // 60)
+                offline_since = None
         except TelegramError as e:
-            log.warning("%s; retrying in 30 s", e)
+            if offline_since is None:  # one line per outage, not one every 30 s
+                offline_since = time.time()
+                log.warning("%s; retrying every 30 s", e)
             time.sleep(30)
             continue
+        # Answer slow taps in this batch first: a tap queued behind a slow one used to be answered too late.
+        for update in updates:
+            cq = update.get("callback_query")
+            if cq and listener.is_mine(cq) and listener.is_slow(cq):
+                cq["_tap"] = Tap(listener.tg, cq["id"])
+                cq["_tap"].answer()
         for update in updates:
             offset = update["update_id"] + 1
             try:
@@ -376,8 +542,9 @@ def main():
                     listener.handle(update["callback_query"])
                 elif "message" in update:
                     listener.handle_message(update["message"])
-            except Exception:
+            except Exception as e:
                 log.exception("failed to handle an update")
+                listener.report_error(e)
         if time.time() - last_expire > EXPIRE_EVERY_S:
             try:
                 listener.expire_old()

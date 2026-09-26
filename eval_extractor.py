@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import ollama
 
 from config import load_config
-from extractor import extract_items
+from extractor import UnreadableAnswer, extract_items
 
 TZ = ZoneInfo("Asia/Kolkata")
 SAT = datetime(2026, 9, 26, 10, 9, tzinfo=TZ)
@@ -117,7 +117,10 @@ def evaluate(model, llm_base):
         for i, (received, subject, body, expected) in enumerate(CASES):
             msg = {"id": "eval", "subject": subject, "received": received, "sender": "someone@iiit.ac.in", "body": body}
             t = time.time()
-            got = [_key(it) for it in extract_items(msg, llm, "Asia/Kolkata", 0.6, received)]
+            try:
+                got = [_key(it) for it in extract_items(msg, llm, "Asia/Kolkata", 0.6, received)]
+            except UnreadableAnswer:
+                got = []  # invalid JSON from the model counts as "found nothing"
             times.append(time.time() - t)
             if i == 0:
                 split = gpu_split(model)

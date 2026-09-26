@@ -24,9 +24,14 @@ def _blocked(*args, **kwargs):
 def isolated(tmp_path, monkeypatch):
     import subprocess
 
+    import httplib2
+    import httpx
     import requests
 
+    import auth
+    import calwatch
     import logsetup
+    import morning
     import planner
     import state
     import telegram_bot
@@ -34,9 +39,14 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(logsetup, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(planner, "LOCK_FILE", tmp_path / ".planner.lock")
+    monkeypatch.setattr(calwatch, "LOCK_FILE", tmp_path / ".calwatch.lock")
+    monkeypatch.setattr(morning, "BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(auth, "TOKEN_FILE", tmp_path / "no-token.json")   # never the real login
     monkeypatch.setattr(telegram_bot.Telegram, "call", _blocked)
     monkeypatch.setattr(requests, "post", _blocked)
     monkeypatch.setattr(requests, "get", _blocked)
+    monkeypatch.setattr(httplib2.Http, "request", _blocked)                # Google APIs
+    monkeypatch.setattr(httpx.Client, "send", _blocked)                     # Ollama
     monkeypatch.setattr(subprocess, "run", _blocked)
     monkeypatch.setattr(subprocess, "Popen", _blocked)
     return tmp_path
@@ -52,7 +62,7 @@ class FakeTelegram:
     chat_id = 42
 
     def __init__(self):
-        self.sent, self.edits, self.answers, self._next = [], {}, [], 100
+        self.sent, self.edits, self.answers, self._next, self._answered = [], {}, [], 100, set()
 
     def send(self, text, buttons=None, keyboard=None):
         self._next += 1
@@ -61,8 +71,12 @@ class FakeTelegram:
 
     def edit(self, message_id, text, buttons=None):
         self.edits[message_id] = {"text": text, "buttons": buttons}
+        return True
 
     def answer(self, callback_id, text=""):
+        # Telegram accepts one answer per tap; a second one is silently lost, so tests must never need one.
+        assert callback_id not in self._answered, f"tap {callback_id!r} answered twice ({text!r})"
+        self._answered.add(callback_id)
         self.answers.append(text)
 
 
@@ -150,10 +164,15 @@ class _Events:
         from googleapiclient.errors import HttpError
         import httplib2
         pool = self.fake.evs.get(calendarId, []) + list(self.fake.masters.get(calendarId, {}).values())
+        pool += [{**body, "id": cid} for cid, (cal, body) in self.fake.inserted.items()
+                 if cal == calendarId and (calendarId, cid) not in self.fake.deleted]
         for ev in pool:
             if ev["id"] == eventId:
                 return _Exec(ev)
         raise HttpError(httplib2.Response({"status": 404}), b"not found")
+
+    def instances(self, calendarId, eventId, **kwargs):
+        return _Exec({"items": [e for e in self.fake.evs.get(calendarId, []) if e.get("recurringEventId") == eventId]})
 
     def insert(self, calendarId, body):
         self.fake._n += 1

@@ -42,8 +42,9 @@ def get_credentials(interactive=None):
     they raise AuthExpired instead (an old version waited forever for a login nobody could see)."""
     creds = None
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
-        # A token granted for fewer scopes (e.g. older version of this app) must be redone.
+        # Loaded with the scopes it was granted (passing SCOPES here would overwrite them, so the check below
+        # could never notice a token granted for fewer scopes, e.g. by an older version of this app).
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE))
         if not creds.has_scopes(SCOPES):
             creds = None
 

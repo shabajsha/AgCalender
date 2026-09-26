@@ -38,7 +38,16 @@ approval:
 skip_senders:
   - life@lists.iiit.ac.in      # clubs, fests, events
 
-# An email is sent to the LLM only if its subject/body contains one of these (whole words).
+# Emails whose subject contains any of these are skipped (machine notices that never hold a deadline).
+skip_subjects:
+  - shared with you          # Google Docs/Slides share notifications
+  - flow(s) have failed      # Power Automate failure notices
+
+# An email is sent to the LLM only if it passes this pre-filter (saves GPU time):
+#  - a strong word anywhere; plurals and hyphen/space variants count ("Exams", "Mid-sem", "Quizzes"), or
+#  - a weak word together with a concrete day in the same sentence ("fill the feedback form by Friday"), or
+#  - "till / until / by / before <day>" ("active till 28th September")
+# Emails skipped here are listed with /skipped in Telegram, with a "Read anyway" button.
 keywords:
   - due
   - deadline
@@ -47,14 +56,30 @@ keywords:
   - quiz
   - exam
   - midsem
+  - mid sem
+  - mid semester
   - endsem
+  - end sem
+  - end semester
   - evaluation
   - viva
   - meeting
   - class cancelled
   - class canceled
   - rescheduled
+  - postponed
+  - preponed
   - lab
+  - assignment
+weak_keywords:
+  - feedback
+  - form
+  - reminder
+  - registration
+  - register
+  - last date
+  - closes
+  - extended
 
 # Optional: a URL pinged on every mail check (e.g. a free healthchecks.io check with a Telegram integration).
 # If the pings stop, that service messages you that the laptop is off. Empty = disabled.
@@ -93,6 +118,7 @@ digest:
 morning:
   checkin: true                # ask for today's to-dos before planning and the morning message
   wait_minutes: 45             # go ahead without an answer after this long
+  latest_checkin: "18:00"      # laptop first on after this: no "good morning" question, just plan what's left
   todo_tasklist: 'MDY3MjgzMjQwODkyOTI3NTU4MzQ6MDow'   # "DAILY TASKS"
   todo_default_minutes: 30     # for to-dos sent without a time
 

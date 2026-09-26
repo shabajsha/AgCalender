@@ -3,9 +3,10 @@ import json
 import logging
 import re
 from datetime import datetime, time, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-from dates import resolve_date, resolve_time
+from dates import MONTH, resolve_date, resolve_time, resolve_time_range
 from llm import LLMUnavailable, chat_json  # noqa: F401  (LLMUnavailable re-exported for ingest.py)
 
 log = logging.getLogger(__name__)
@@ -14,7 +15,17 @@ TYPES = {"deadline", "meeting", "event"}
 MAX_BODY_CHARS = 3500  # keeps prompt + email + answer inside num_ctx 2048
 MAX_ITEMS_PER_EMAIL = 5  # a hostile or weird email can't flood the calendar
 URL_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
-TIME_IN_TEXT_RE = re.compile(r"\d\s*(am|pm)\b|\d:\d\d", re.IGNORECASE)
+# A concrete day, for the "weak word + date" and "till/by <date>" pre-filter rules.
+DATE_WORDS = (rf"\d{{1,2}}(?:st|nd|rd|th)?\s*(?:of\s+)?{MONTH}\b|{MONTH}\s*\d{{1,2}}(?:st|nd|rd|th)?\b|\d{{1,2}}/\d{{1,2}}\b"
+              r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b")
+DATE_WORD_RE = re.compile(rf"\b(?:{DATE_WORDS})", re.IGNORECASE)
+DEADLINE_PHRASE_RE = re.compile(rf"\b(?:till|until|by|before|no later than|on or before)\s+(?:[\w,]+\s+){{0,3}}?(?:{DATE_WORDS})",
+                                re.IGNORECASE)
+SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+class UnreadableAnswer(Exception):
+    """The model's answer wasn't JSON. Retrying at temperature 0 would give the same answer."""
 
 SYSTEM_PROMPT = "You extract calendar items from university emails. Reply with JSON only."
 
@@ -41,9 +52,29 @@ Rules:
 - If there are no such items (newsletters, ads, general announcements), return {{"items": []}}."""
 
 
-def matches_keywords(text, keywords):
-    pattern = r"\b(" + "|".join(re.escape(k) for k in keywords) + r")\b"
-    return re.search(pattern, text, re.IGNORECASE) is not None
+def _word_pattern(keyword):
+    """'mid sem' also matches 'midsem', 'Mid-sem' and 'mid sems'; 'quiz' matches 'quizzes'."""
+    return r"[\s-]*".join(re.escape(w) + r"(?:e?s|zes)?" for w in keyword.lower().split())
+
+
+@lru_cache(maxsize=8)
+def _keyword_re(keywords):
+    if not keywords:
+        return None
+    return re.compile(r"\b(?:" + "|".join(_word_pattern(k) for k in keywords) + r")\b", re.IGNORECASE)
+
+
+def matches_keywords(text, keywords, weak_keywords=()):
+    """Worth asking the model about? A strong word anywhere (deadline, quiz, mid-sem...); or a weak word
+    (feedback, form, reminder...) with a concrete day in the same sentence; or "till/by <day>".
+    Whole words only, but plurals and hyphen/space variants count ("Exams", "Mid-sem", "Quizzes")."""
+    strong = _keyword_re(tuple(keywords))
+    if strong and strong.search(text):
+        return True
+    weak = _keyword_re(tuple(weak_keywords or ()))
+    if weak and any(weak.search(s) and DATE_WORD_RE.search(s) for s in SENTENCE_RE.split(text)):
+        return True
+    return DEADLINE_PHRASE_RE.search(text) is not None
 
 
 def clean_text(value, limit=100):
@@ -80,17 +111,18 @@ def validate(raw, received, tz_name, min_confidence, now):
         if day is None:
             log.info("dropped item %r: no specific day in %r", title, date_text)
             continue
-        start_time = resolve_time(it.get("start_time"))
-        if start_time is None and isinstance(date_text, str) and TIME_IN_TEXT_RE.search(date_text):
-            start_time = resolve_time(date_text)  # model put "Oct 12, 9:30 AM" all in "date"
-        end_time = resolve_time(it.get("end_time"))
+        start_time, range_end = resolve_time_range(it.get("start_time"))  # "2-4 PM" gives both
+        if start_time is None:
+            start_time, range_end = resolve_time_range(date_text)  # model put "Oct 12, 9:30 AM" all in "date"
+        end_time = resolve_time(it.get("end_time")) or range_end
 
         course = clean_text(it.get("course"), 60) or None
         item = {"type": kind, "title": title, "course": course,
                 "location": None, "description": None, "recurrence": None, "due": None}
 
         if kind == "deadline":
-            due = datetime.combine(day, start_time or time(23, 59), tz)
+            # a submission window ("10 AM - 11:59 PM") is due at its end
+            due = datetime.combine(day, end_time or start_time or time(23, 59), tz)
             item.update(due=due, start=due - timedelta(minutes=30), end=due, all_day=False)
             check = due
         elif start_time:
@@ -134,5 +166,5 @@ def extract_items(msg, llm, tz_name, min_confidence, now):
         raw = json.loads(content)
     except json.JSONDecodeError:
         log.warning("model returned invalid JSON for %r: %.200s", msg["subject"], content)
-        return []
+        raise UnreadableAnswer(msg["subject"]) from None
     return validate(raw, _reference(msg), tz_name, min_confidence, now)

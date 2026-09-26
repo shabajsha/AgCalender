@@ -12,8 +12,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS processed_messages (
     msg_id       TEXT PRIMARY KEY,
     fingerprint  TEXT,
-    outcome      TEXT,          -- created / no-items / no-keyword / duplicate
-    processed_at TEXT
+    outcome      TEXT,          -- items / created / no-items / no-keyword / unreadable / duplicate / skipped-...
+    processed_at TEXT,
+    subject      TEXT           -- kept for emails the filter skipped, so /skipped can list them
 );
 CREATE INDEX IF NOT EXISTS idx_fingerprint ON processed_messages(fingerprint);
 CREATE TABLE IF NOT EXISTS created_items (
@@ -83,6 +84,15 @@ CREATE TABLE IF NOT EXISTS todos (
     status     TEXT,              -- active / undone
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS series_copies (
+    row_id       INTEGER,         -- watched_events row of a tracked repeating event
+    instance_key TEXT,            -- the source occurrence's event id
+    copy_id      TEXT,            -- its one-off copy on College
+    start        TEXT,
+    snapshot     TEXT,            -- JSON of the occurrence as copied (to notice it moving)
+    missing      INTEGER DEFAULT 0,  -- scans in a row it wasn't found at the source
+    PRIMARY KEY (row_id, instance_key)
+);
 CREATE TABLE IF NOT EXISTS sender_prefs (
     sender     TEXT PRIMARY KEY,
     pref       TEXT,             -- asked / blocked / keep
@@ -142,7 +152,8 @@ class State:
 
     def _migrate(self):
         """Adds columns introduced after a table was first created (CREATE TABLE IF NOT EXISTS won't)."""
-        added = {"watched_events": [("review", "TEXT"), ("review_batch", "INTEGER")]}
+        added = {"watched_events": [("review", "TEXT"), ("review_batch", "INTEGER")],
+                 "processed_messages": [("subject", "TEXT")]}
         for table, columns in added.items():
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, kind in columns:
@@ -168,9 +179,26 @@ class State:
         self.db.commit()
         return self.db.execute("SELECT count FROM failures WHERE msg_id = ?", (msg_id,)).fetchone()[0]
 
-    def mark_processed(self, msg_id, fingerprint, outcome):
-        self.db.execute("INSERT OR REPLACE INTO processed_messages VALUES (?, ?, ?, ?)",
-                        (msg_id, fingerprint, outcome, _now()))
+    def mark_processed(self, msg_id, fingerprint, outcome, subject=None):
+        self.db.execute("INSERT OR REPLACE INTO processed_messages (msg_id, fingerprint, outcome, processed_at, subject) "
+                        "VALUES (?, ?, ?, ?, ?)", (msg_id, fingerprint, outcome, _now(), subject))
+        self.db.commit()
+
+    SKIPPED_OUTCOMES = ("no-keyword", "unreadable")
+
+    def skipped_messages(self, limit=10, since=None):
+        """Emails the filter (or an unreadable model answer) left out, newest first: [{msg_id, subject, outcome, ...}]."""
+        sql = (f"SELECT * FROM processed_messages WHERE outcome IN ({','.join('?' * len(self.SKIPPED_OUTCOMES))}) "
+               "AND subject IS NOT NULL")
+        args = list(self.SKIPPED_OUTCOMES)
+        if since:
+            sql, args = sql + " AND processed_at >= ?", args + [since.astimezone(timezone.utc).isoformat(timespec="seconds")]
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY processed_at DESC LIMIT ?", args + [limit])]
+
+    def forget_processed(self, msg_id):
+        """So "Read anyway" can process an email again."""
+        self.db.execute("DELETE FROM processed_messages WHERE msg_id = ?", (msg_id,))
+        self.db.execute("DELETE FROM failures WHERE msg_id = ?", (msg_id,))
         self.db.commit()
 
     def item_exists(self, dedupe_key):
@@ -347,9 +375,25 @@ class State:
         self.db.execute(f"UPDATE watched_events SET {cols} WHERE id = ?", (*fields.values(), row_id))
         self.db.commit()
 
-    def watch_rows(self, cal_id=None, statuses=None, batch=None, review=None, review_batch=None):
+    def watch_set_if(self, row_id, expected_status, **fields):
+        """watch_set, but only if the row's status is still `expected_status` (a tap in the listener may have
+        decided it while a scan was running). Returns True if it was updated."""
+        bad = set(fields) - self.WATCH_FIELDS
+        if bad:
+            raise ValueError(f"unknown watched_events fields: {bad}")
+        if "snapshot" in fields and not isinstance(fields["snapshot"], str):
+            fields["snapshot"] = json.dumps(fields["snapshot"])
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        cur = self.db.execute(f"UPDATE watched_events SET {cols} WHERE id = ? AND status = ?",
+                              (*fields.values(), row_id, expected_status))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    def watch_rows(self, cal_id=None, statuses=None, batch=None, review=None, review_batch=None, message_id=None):
         """review=True: anything waiting for the daily review; a string: that kind only."""
         sql, args = "SELECT * FROM watched_events WHERE 1=1", []
+        if message_id is not None:
+            sql, args = sql + " AND tg_message_id = ?", args + [message_id]
         if review is True:
             sql += " AND review IS NOT NULL AND review != ''"
         elif review:
@@ -364,6 +408,25 @@ class State:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             args += list(statuses)
         return [dict(r) for r in self.db.execute(sql + " ORDER BY start", args)]
+
+    # --- one-off copies of a tracked repeating event's upcoming occurrences ---------------------
+
+    def series_copies(self, row_id):
+        return [dict(r) for r in self.db.execute("SELECT * FROM series_copies WHERE row_id = ? ORDER BY start", (row_id,))]
+
+    def series_copy_set(self, row_id, instance_key, copy_id, start, snapshot, missing=0):
+        self.db.execute("INSERT OR REPLACE INTO series_copies VALUES (?, ?, ?, ?, ?, ?)",
+                        (row_id, instance_key, copy_id, start, json.dumps(snapshot), missing))
+        self.db.commit()
+
+    def series_copy_missing(self, row_id, instance_key, missing):
+        self.db.execute("UPDATE series_copies SET missing = ? WHERE row_id = ? AND instance_key = ?",
+                        (missing, row_id, instance_key))
+        self.db.commit()
+
+    def series_copy_delete(self, row_id, instance_key):
+        self.db.execute("DELETE FROM series_copies WHERE row_id = ? AND instance_key = ?", (row_id, instance_key))
+        self.db.commit()
 
     def watch_statuses(self):
         """{(cal_id, event_key): status} for everything the watcher knows about."""

@@ -18,3 +18,4 @@ telegram.json
 state.db-journal
 .pytest_cache/
 token.json.tmp
+backups/

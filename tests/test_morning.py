@@ -28,9 +28,11 @@ def calls(monkeypatch, tmp_path):
     monkeypatch.setattr(morning.planner, "plan_today",
                         lambda cfg, st, now, how: log["plans"].append(now) or ("Plan for x", "Work\n- 09:00  DSA", 1))
     monkeypatch.setattr(morning.digest, "build_digest",
-                        lambda cfg, now, skip_planner_blocks: ("t", [("Today", ["- class"]), ("Deadlines", ["- None"])]))
+                        lambda cfg, now, skip_planner_blocks, state=None: ("t", [("Today", ["- class"]), ("Deadlines", ["- None"])]))
+    monkeypatch.setattr(morning.alerts, "alert", lambda key, text, state=None: log.setdefault("alerts", []).append(key))
     monkeypatch.setattr(morning, "deliver",
-                        lambda title, text, ch, buttons=None: (log["sent"].append(text) or ch) if log["deliver_ok"] else [])
+                        lambda title, text, ch, buttons=None: (log["sent"].append(text) or ch) if log["deliver_ok"] else
+                        [c for c in ch if c != "telegram"])
     monkeypatch.setattr(morning, "LOG_DIR", tmp_path)
     return log
 
@@ -78,14 +80,24 @@ def test_failed_delivery_is_retried(calls, db):
     assert db.get_meta(morning.MORNING_SENT) == T(6).date().isoformat() and len(calls["sent"]) == 1
 
 
-def test_error_while_planning_does_not_lose_the_day(calls, db, monkeypatch):
+def test_offline_while_planning_retries_at_the_next_tick(calls, db, monkeypatch):
+    from google.auth.exceptions import TransportError
     db.set_meta(morning.CHECKIN_SENT, T(6, 45).isoformat())
     db.set_meta(morning.CHECKIN_ANSWERED, T(6).date().isoformat())
-    monkeypatch.setattr(morning.planner, "plan_today", lambda *a, **k: (_ for _ in ()).throw(OSError("no network")))
-    with pytest.raises(OSError):
+    monkeypatch.setattr(morning.planner, "plan_today", lambda *a, **k: (_ for _ in ()).throw(TransportError("no DNS")))
+    with pytest.raises(TransportError):
         morning.tick(CFG, db, T(7))
     assert db.get_meta(morning.MORNING_SENT) in (None, "")       # next tick will try again
     assert db.get_meta(morning.IN_PROGRESS) == ""
+
+
+def test_a_planner_bug_still_sends_the_morning_message(calls, db, monkeypatch):
+    db.set_meta(morning.CHECKIN_SENT, T(6, 45).isoformat())
+    db.set_meta(morning.CHECKIN_ANSWERED, T(6).date().isoformat())
+    monkeypatch.setattr(morning.planner, "plan_today", lambda *a, **k: (_ for _ in ()).throw(KeyError("window")))
+    morning.tick(CFG, db, T(7))
+    assert "Couldn't plan today (KeyError)" in calls["sent"][0] and "- class" in calls["sent"][0]
+    assert db.get_meta(morning.MORNING_SENT) == T(6).date().isoformat() and calls["alerts"] == ["crash:planner"]
 
 
 def test_calendar_review_goes_out_once_before_the_checkin(calls, db, monkeypatch):
@@ -113,3 +125,28 @@ def test_calendar_review_retries_when_telegram_is_down(calls, db, monkeypatch):
     morning.tick(cfg, db, T(7, 0))
     morning.tick(cfg, db, T(7, 15))
     assert len(tries) == 2                                   # failed once, sent on the next tick, then done
+
+
+def test_desktop_alone_does_not_count_telegram_gets_it_later(calls, db):
+    cfg = {**CFG, "digest": {"channels": ["desktop", "telegram"]}}
+    db.set_meta(morning.CHECKIN_SENT, T(6, 45).isoformat())
+    db.set_meta(morning.CHECKIN_ANSWERED, T(6).date().isoformat())
+    calls["deliver_ok"] = False                                   # desktop works, Telegram doesn't (no Wi-Fi yet)
+    morning.tick(cfg, db, T(7))
+    assert db.get_meta(morning.MORNING_SENT) != T(6).date().isoformat() and len(calls["plans"]) == 1
+    calls["deliver_ok"] = True
+    morning.tick(cfg, db, T(7, 15))
+    assert db.get_meta(morning.MORNING_SENT) == T(6).date().isoformat()
+    assert len(calls["plans"]) == 1 and "Sent late" in calls["sent"][-1]    # same message, not planned again
+
+
+def test_no_good_morning_at_night(calls, db):
+    morning.tick(CFG, db, T(21, 0))                                # laptop first on at 21:00
+    assert not calls["checkins"] and calls["plans"]
+    assert calls["sent"][0].startswith("Late start")
+
+
+def test_daily_backup(calls, db, tmp_path):
+    morning.tick(CFG, db, T(6, 0))
+    morning.tick(CFG, db, T(6, 15))
+    assert [f.name for f in morning.BACKUP_DIR.iterdir()] == ["state-2026-09-28.db"]

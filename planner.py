@@ -34,7 +34,8 @@ from notifiers import deliver
 from state import State
 
 LOCK_FILE = logsetup.LOG_DIR / ".planner.lock"
-LOCK_WAIT_S = 60
+LOCK_WAIT_S = 420   # longer than the model's timeout (ollama.timeout_s = 300): a plan can be ranking that long
+REPLAN_FLAG = "replan_requested"  # set by the listener when Done is tapped while a plan is running
 DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 log = logging.getLogger("planner")
 
@@ -66,7 +67,10 @@ def open_work(cal, tasks_api, cfg, state, now, horizon):
         if state.task_for_event(ev["id"]) in finished:
             continue  # you've completed its task: stop planning it
         key = f"event:{ev['id']}"
-        items.append({"key": key, "title": ev["summary"][len(DUE_PREFIX):], "due": _local(ev["end"], tz),
+        due = _local(ev["end"], tz)
+        if due is None:  # an all-day "DUE:" event (made by hand): due at the end of that day
+            due = datetime.combine(date.fromisoformat(ev["start"]["date"]), slots.hm("23:59"), tz)
+        items.append({"key": key, "title": ev["summary"][len(DUE_PREFIX):], "due": due,
                       "effort_h": state.get_effort(key) or pc["default_effort_hours"]})
     carry = timedelta(days=pc.get("carry_over_days", 3))
     for t in gtasks.open_dated_tasks(tasks_api, cfg.get("tasklist"), horizon.date()):
@@ -79,14 +83,31 @@ def open_work(cal, tasks_api, cfg, state, now, horizon):
     return items
 
 
-def minutes_today(item, done_min, today, min_block):
+def work_days_left(due, today, work_start, gap, min_block):
+    """Days from today up to the last one that still has at least `min_block` of work time before the due time.
+    (A deadline at 09:00 or midnight leaves no time on its own day; counting that day under-planned it.)"""
+    last = due.date()
+    if due - timedelta(minutes=gap) - datetime.combine(last, work_start, due.tzinfo) < timedelta(minutes=min_block):
+        last -= timedelta(days=1)
+    return max(1, (last - today).days + 1)
+
+
+def minutes_today(item, done_min, today, min_block, work_start=slots.hm("08:00"), gap=15):
     """Even share of the remaining work over the days left (today included), in whole min-block units."""
     remaining = max(0, item["effort_h"] * 60 - done_min)
     if remaining < min_block:
         return 0, remaining
-    days_left = max(1, (item["due"].date() - today).days + 1)
+    days_left = work_days_left(item["due"], today, work_start, gap, min_block)
     share = math.ceil(remaining / days_left / min_block) * min_block
     return min(remaining, max(share, min_block)), remaining
+
+
+def item_min_block(item, pc):
+    """Deadlines are worked on in blocks of at least min_block_minutes; a short to-do ("Call bank 15m") gets a
+    block of its own length, rounded up to 15 min (it used to be dropped from the plan)."""
+    if item["key"].startswith("event:"):
+        return pc["min_block_minutes"]
+    return min(pc["min_block_minutes"], 15 * max(1, math.ceil(round(item["effort_h"] * 60) / 15)))
 
 
 class PlannerBusy(Exception):
@@ -167,35 +188,41 @@ def _plan_today(cfg, state, now, dry_run, how):
 
     # 4. Work: how much each item needs today, ranked, then placed earliest-first inside the work window.
     horizon = day_start + timedelta(days=pc["horizon_days"] + 1)
+    # Blocks that have started count in full (a block in progress is still going to happen; counting it only up
+    # to now used to re-plan its remainder and break the daily cap).
     history = google_writer.list_blocks(cal, cals["planner"], now - timedelta(days=60), now)
     done_by_key = {}
     for b in history:
         key = b.get("extendedProperties", {}).get("private", {}).get("work_key")
-        if key:
-            s, e = _local(b["start"], tz), min(_local(b["end"], tz), now)
+        s, e = _local(b["start"], tz), _local(b["end"], tz)
+        if key and s is not None and s < now:
             done_by_key[key] = done_by_key.get(key, 0) + max(0, (e - s).total_seconds() / 60)
+    work_start = slots.hm(pc["work_window"][0])
     items = []
     for it in open_work(cal, tasks_api, cfg, state, now, horizon):
-        it["today_min"], remaining = minutes_today(it, done_by_key.get(it["key"], 0), today, pc["min_block_minutes"])
+        it["min_block"] = item_min_block(it, pc)
+        it["effort_h"] = max(it["effort_h"], it["min_block"] / 60)
+        it["today_min"], remaining = minutes_today(it, done_by_key.get(it["key"], 0), today, it["min_block"],
+                                                   work_start, gap)
         it["remaining_h"] = round(remaining / 60, 1)
         if it["today_min"]:
             items.append(it)
     ranked, used_llm = ranker.rank(items, cfg["ollama"], today)
 
     work_free = slots.intersect(free, (slots.at(today, pc["work_window"][0], tz), slots.at(today, pc["work_window"][1], tz)))
-    worked_today = sum((min(_local(b["end"], tz), now) - _local(b["start"], tz)).total_seconds() / 60
-                       for b in kept[cals["planner"]])
+    worked_today = sum((_local(b["end"], tz) - _local(b["start"], tz)).total_seconds() / 60
+                       for b in kept[cals["planner"]] if _local(b["start"], tz) is not None)
     cap = max(0, pc["max_work_hours_per_day"] * 60 - worked_today)
     work_blocks, short = [], []
     for it in ranked:
         want = min(it["today_min"], cap)
         before_due = slots.intersect(work_free, (day_start, it["due"] - timedelta(minutes=gap)))  # never after it's due
-        blocks, _ = slots.fill(before_due, want, pc["block_minutes"], pc["min_block_minutes"], gap)
+        blocks, _ = slots.fill(before_due, want, pc["block_minutes"], it["min_block"], gap)
         work_free = slots.subtract(work_free, slots.pad(blocks, gap))
         got = sum((e - s).total_seconds() / 60 for s, e in blocks)
         cap -= got
         work_blocks += [(it, b) for b in blocks]
-        if it["today_min"] - got >= pc["min_block_minutes"]:  # smaller leftovers just roll into tomorrow
+        if it["today_min"] - got >= it["min_block"]:  # smaller leftovers just roll into tomorrow
             short.append((it, it["today_min"] - got))
 
     # 5. Write it.
@@ -230,16 +257,23 @@ def summarize(now, habit_blocks, missed_habits, work_blocks, short, used_llm, ra
     return f"Plan for {now:%a %d %b} (from {slots.round_up(now):%H:%M})", "\n".join(lines)
 
 
-def clear_day(cfg, day):
+def clear_day(cfg, day, now):
+    """Removes the day's planned blocks that haven't started. Blocks already begun or done stay: they are the
+    record of work done that later plans count. Returns the number removed, or None for a day that is over."""
+    if day < now.date():
+        return None
     tz = ZoneInfo(cfg["timezone"])
-    cal = build("calendar", "v3", credentials=get_credentials())
-    start, end = slots.at(day, "00:00", tz), slots.at(day + timedelta(days=1), "00:00", tz)
-    removed = 0
-    for cid in (cfg["calendars"]["planner"], cfg["calendars"]["habits"]):
-        for b in google_writer.list_blocks(cal, cid, start, end):
-            if b.get("extendedProperties", {}).get("private", {}).get("plan_date") == day.isoformat():
-                google_writer.delete_event(cal, cid, b["id"])
-                removed += 1
+    with planning_lock():
+        cal = build("calendar", "v3", credentials=get_credentials())
+        start, end = slots.at(day, "00:00", tz), slots.at(day + timedelta(days=1), "00:00", tz)
+        removed = 0
+        for cid in (cfg["calendars"]["planner"], cfg["calendars"]["habits"]):
+            for b in google_writer.list_blocks(cal, cid, start, end):
+                begins = _local(b["start"], tz)
+                if (b.get("extendedProperties", {}).get("private", {}).get("plan_date") == day.isoformat()
+                        and (begins is None or begins >= now)):
+                    google_writer.delete_event(cal, cid, b["id"])
+                    removed += 1
     return removed
 
 
@@ -260,10 +294,15 @@ def main():
 
     if args.clear:
         day = args.date or now.date()
-        removed = clear_day(cfg, day)
+        removed = clear_day(cfg, day, now)
+        if removed is None:
+            deliver(f"Plan for {day:%a %d %b}", "That day is over, so its blocks stay: they're the record of work "
+                                               "you did, which later plans count.", channels)
+            return
         state.record_plan(day, "cleared")
         log.info("cleared %d planner block(s) on %s", removed, day)
-        deliver(f"Plan for {day:%a %d %b} cleared", f"Removed {removed} planned block(s). Send /plan to plan again.", channels)
+        deliver(f"Plan for {day:%a %d %b} cleared", f"Removed {removed} planned block(s) that hadn't started. "
+                "Send /plan to plan again.", channels)
         return
 
     plan_after = slots.at(now.date(), cfg["planner"]["plan_after"], now.tzinfo)
@@ -271,6 +310,10 @@ def main():
         return  # too early, or today already planned / cleared: nothing to do
 
     title, text, placed = plan_today(cfg, state, now, dry_run=args.print, how="auto" if args.auto else "manual")
+    if not args.print and not args.auto and state.get_meta(REPLAN_FLAG):
+        state.set_meta(REPLAN_FLAG, "")  # Done was tapped while this plan ran: plan once more with the new to-dos
+        now = datetime.now(ZoneInfo(cfg["timezone"]))
+        title, text, placed = plan_today(cfg, state, now, how="manual")
     if args.print:
         print(title + "\n\n" + text)
         return

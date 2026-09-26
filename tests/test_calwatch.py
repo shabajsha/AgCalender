@@ -1,3 +1,4 @@
+import itertools
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -48,9 +49,12 @@ def watch(s, now=NOW):
     return calwatch.Watcher(CFG, s.db, s.cal, s.tasks, s.tg, now).run()
 
 
+TAP_IDS = itertools.count(1)
+
+
 def tap(s, data, message_id=500):
     action, _, rest = data.partition(":")
-    calwatch.handle_callback(s.listener, {"id": "cb", "data": data, "message": {"message_id": message_id}}, action, rest, NOW)
+    calwatch.handle_callback(s.listener, {"id": f"cb{next(TAP_IDS)}", "data": data, "message": {"message_id": message_id}}, action, rest, NOW)
 
 
 def row_for(s, cal_id, key):
@@ -93,19 +97,36 @@ def test_track_copies_into_college_and_follows_changes(setup):
     watch(setup)
     assert setup.cal.patched and setup.cal.patched[-1][1] == "copy1"
     assert "The College copy was updated" in setup.tg.sent[-1]["text"]
-    # the original is cancelled: the copy is removed and you're told
+    # the original is cancelled: after a second scan (a feed can blip once) the copy is removed and you're told
     setup.cal.evs[OUTLOOK] = setup.cal.evs[OUTLOOK][1:]
+    watch(setup)
+    assert (COLLEGE, "copy1") not in setup.cal.deleted and row_for(setup, OUTLOOK, "m1")["status"] == "tracked"
     watch(setup)
     assert (COLLEGE, "copy1") in setup.cal.deleted
     assert "was cancelled on Outlook" in setup.tg.sent[-1]["text"]
     assert row_for(setup, OUTLOOK, "m1")["status"] == "gone"
 
 
-def test_series_copy_keeps_its_recurrence(setup):
+def test_series_is_copied_occurrence_by_occurrence(setup):
     watch(setup)
-    tap(setup, f"cal:t:{row_for(setup, OUTLOOK, 's1')['id']}")
-    _, body = setup.cal.inserted["copy1"]
-    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=TU"]
+    row = row_for(setup, OUTLOOK, "s1")
+    tap(setup, f"cal:t:{row['id']}")
+    copies = {body["extendedProperties"]["private"]["mirror_of"]: (cid, body) for cid, (_, body) in setup.cal.inserted.items()}
+    assert set(copies) == {f"{OUTLOOK}|s1|s1_a", f"{OUTLOOK}|s1|s1_b"}          # each upcoming class, no RRULE
+    assert all("recurrence" not in body for _, body in copies.values())
+    # next week's class moves an hour: only that copy moves; the series itself hasn't "changed"
+    setup.cal.evs[OUTLOOK][2] = event("s1_b", h(27 + 168), h(28 + 168), "DSA tutorial", recurringEventId="s1")
+    watch(setup)
+    moved = copies[f"{OUTLOOK}|s1|s1_b"][0]
+    assert setup.cal.patched[-1][1] == moved and "class moved; College updated" in setup.tg.sent[-1]["text"]
+    assert not any(m["text"].startswith("Changed on") for m in setup.tg.sent)
+    # tomorrow's class is cancelled: after a second scan its copy goes, the rest of the series stays
+    del setup.cal.evs[OUTLOOK][1]
+    watch(setup)
+    watch(setup)
+    assert (COLLEGE, copies[f"{OUTLOOK}|s1|s1_a"][0]) in setup.cal.deleted
+    assert (COLLEGE, moved) not in setup.cal.deleted and row_for(setup, OUTLOOK, "s1")["status"] == "tracked"
+    assert "one was cancelled; removed from College" in setup.tg.sent[-1]["text"]
 
 
 def test_ignore_and_untrack(setup):
@@ -206,7 +227,7 @@ def test_two_weekly_slots_of_a_course_are_one_question(setup):
     assert "Repeats weekly on Tue, Wed until 30 Nov 2026 (2 weekly slots)" in cards[0]["text"]
     tap(setup, cards[0]["buttons"][0][0][1], message_id=cards[0]["id"])
     copies = [body for cid, body in setup.cal.inserted.values() if body["summary"] == "EC4.401 - Robotics"]
-    assert len(copies) == 2 and all(b["recurrence"] for b in copies)
+    assert len(copies) == 2                                                   # this week's class of each slot
 
 
 def test_undo_never_ask_restores_everything(setup):
@@ -222,8 +243,8 @@ def test_undo_never_ask_restores_everything(setup):
     assert all(row_for(setup, OUTLOOK, k)["status"] == "pending" for k in ("m1", "s1"))
     for r in rows:                                                            # cards are live again
         assert setup.tg.edits[r["tg_message_id"]]["buttons"][0] == [("Track", f"cal:t:{r['id']}"), ("Ignore", f"cal:i:{r['id']}")]
-    tap(setup, undo)
-    assert setup.tg.edits[500]["text"] == "Already undone."
+    tap(setup, undo)                                                          # a second tap changes nothing
+    assert 500 not in setup.tg.edits and all(row_for(setup, OUTLOOK, k)["status"] == "pending" for k in ("m1", "s1"))
 
 
 def test_cancel_leaves_the_card_as_it_was(setup):

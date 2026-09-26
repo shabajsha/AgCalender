@@ -58,8 +58,12 @@ def describe_recurrence(recurrence):
 def parse_ics(raw, tz_name):
     tz = ZoneInfo(tz_name)
     cal = Calendar.from_ical(raw)
-    if str(cal.get("method", "")).upper() == "CANCEL":
+    method = str(cal.get("method", "")).upper()
+    if method == "CANCEL":
         log.info("ics: skipping cancellation invite")
+        return []
+    if method in ("REPLY", "COUNTER", "DECLINECOUNTER", "REFRESH"):
+        log.info("ics: skipping %s (someone answering an invite, not a new event)", method)
         return []
 
     items = []
@@ -70,10 +74,16 @@ def parse_ics(raw, tz_name):
             continue
         if not ev.get("dtstart"):
             continue
+        if ev.get("recurrence-id"):
+            # one changed occurrence of a series: not an event of its own (it used to become a duplicate)
+            log.info("ics: skipping a changed occurrence of %r", title)
+            continue
         start = _to_local(ev.get("dtstart").dt, tz)
         all_day = not isinstance(start, datetime)
         if ev.get("dtend"):
             end = _to_local(ev.get("dtend").dt, tz)
+        elif ev.get("duration"):
+            end = start + ev.get("duration").dt
         else:
             end = start + (timedelta(days=1) if all_day else timedelta(hours=1))
 
@@ -89,6 +99,7 @@ def parse_ics(raw, tz_name):
             "location": str(ev.get("location", "")) or None,
             "description": str(ev.get("description", ""))[:2000] or None,
             "recurrence": (["RRULE:" + rrule.to_ical().decode()] + _exdates(ev, tz)) if rrule else None,
+            "uid": str(ev.get("uid", "")) or None,  # kept on the event, so a later update/cancel can find it
         })
     return items
 

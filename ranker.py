@@ -5,7 +5,7 @@ If the model is unavailable or answers badly, the order falls back to earliest d
 import json
 import logging
 
-from llm import LLMUnavailable, chat_json
+from llm import LLMTimeout, LLMUnavailable, chat_json
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def rank(items, llm, today):
         order = answer.get("order") if isinstance(answer, dict) else None
         if not isinstance(order, list):
             raise ValueError("no 'order' list")
-    except (LLMUnavailable, ValueError, json.JSONDecodeError) as e:
+    except (LLMUnavailable, LLMTimeout, ValueError, json.JSONDecodeError) as e:
         log.warning("ranking by due date instead of the model (%s)", e)
         return by_due(items), False
 

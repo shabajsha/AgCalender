@@ -13,13 +13,13 @@ They are listed in `.gitignore`.
 | `auth.py` | `get_credentials()`: loads/refreshes `token.json`, runs the browser login only when needed. Run it directly to log in. |
 | `config.py` | `load_config()`: reads `config.yaml`. |
 | `config.yaml` | Gmail query, timezone, calendar IDs (college / planner / habits), Ollama model, keyword list, confidence threshold. |
-| `ingest.py` | Main job: new emails -> calendar events / tasks. Flags `--dry-run`, `--since DAYS`. |
+| `ingest.py` | Main job: new emails -> calendar events / tasks. Flags `--dry-run`, `--since DAYS`, `--message ID` (read one skipped email anyway). |
 | `gmail_reader.py` | Fetches matching emails; strips the forward header and mailing-list footer; pulls `.ics` attachments; fingerprints emails. |
-| `ics_import.py` | Turns `.ics` invites into events (no LLM). Skips cancellations. |
+| `ics_import.py` | Turns `.ics` invites into events (no LLM). Skips cancellations, replies ("Accepted: ...") and changed single occurrences; keeps the invite UID. |
 | `extractor.py` | Keyword pre-filter, the LLM prompt, and validation of what the model returns. |
 | `dates.py` | Turns date/time words ("next Friday", "12th Oct", "11:59 PM") into real dates. All date math lives here, not in the LLM. |
 | `google_writer.py` | Creates Google Calendar events and Google Tasks. |
-| `state.py` | SQLite `state.db`: processed emails, created items, last run time. |
+| `state.py` | SQLite `state.db`: processed (and skipped) emails, created items, cards, watched calendar events and their occurrence copies, settings flags. Backed up daily to `backups/` (7 kept). |
 | `approvals.py` | Keep running: acts on your Telegram Add / Skip taps, creates approved items, expires old ones, offers to block senders you always skip. |
 | `telegram_bot.py` | Minimal Telegram Bot API client (send with buttons, edit, long-poll). |
 | `telegram_setup.py` | One-time: asks for your bot token (hidden), finds your chat, writes `telegram.json`. |
@@ -36,7 +36,7 @@ They are listed in `.gitignore`.
 | `alerts.py` | Tells you on Telegram (else desktop) when something needs you: expired Google login, Ollama lost the GPU, repeated mail-check errors, an email given up on. Once per problem per 6 h. |
 | `logsetup.py` | One rotating log file per script in `logs/` (1 MB, 3 kept). |
 | `gtasks.py` | Paged Google Tasks helpers shared by the planner and the digest. |
-| `tests/` | pytest suite (no network: a fixture blocks Telegram, Google, Ollama, systemd). Run `venv/bin/python -m pytest`. |
+| `tests/` | pytest suite (no network: a fixture blocks Telegram, Google (httplib2), Ollama (httpx), systemd and the real login). `test_fixes.py` / `test_calfixes.py` hold one regression test per bug from the 26 Sep audit. Run `venv/bin/python -m pytest`. |
 | `eval_extractor.py` | Benchmarks Ollama models on 13 made-up emails with known answers: accuracy, speed, GPU fit, CPU temperature. `python eval_extractor.py gemma2:9b gemma3:4b` |
 | `list_calendars.py` | Prints your calendars' names and IDs, for filling in `config.yaml`. |
 | `test_gmail.py` | Prints the 5 newest emails matching `gmail_query`, to check the query works. |
@@ -47,6 +47,7 @@ They are listed in `.gitignore`.
 | `telegram.json` | Bot token + chat id, created by `telegram_setup.py`. Secret. |
 | `logs/approvals.log` | Log of your Add / Skip decisions. |
 | `logs/digest.md` | The latest digest. |
+| `backups/` | Daily copies of `state.db` (made by the first morning tick of each day; 7 kept). Gitignored. |
 
 ## Setup (Phase 0)
 
@@ -76,9 +77,14 @@ How an email is handled:
    catches every club/fest email) -> skipped.
 3. **Duplicate forward** -> skipped. Each IIITH email currently arrives twice with different forward
    headers; after removing the header the copies have the same fingerprint.
-4. **Has an `.ics` invite** -> imported directly as an event.
-5. **No keyword** from `config.yaml` in subject/body -> skipped (no LLM call).
-6. Otherwise **gemma2:9b** lists the items, copying date/time words exactly as written; `dates.py`
+4. **Subject on `skip_subjects`** (machine notices such as "Presentation shared with you") -> skipped.
+5. **Has an `.ics` invite** -> imported directly as an event.
+6. **Pre-filter** (saves GPU time): the email goes to the model only if it has a strong word from `keywords`
+   anywhere (plurals and hyphen/space variants count: "Exams", "Mid-sem", "Quizzes"), or a `weak_keywords` word
+   with a concrete day in the same sentence ("fill the feedback form by Friday"), or "till / until / by / before
+   <day>" ("active till 28th September"). Everything else is skipped but remembered: **`/skipped`** lists those
+   emails with **Read** buttons that run the model on one anyway.
+7. Otherwise **gemma2:9b** lists the items, copying date/time words exactly as written; `dates.py`
    turns them into dates. Items that are in the past, over a year away, have no specific day, or have
    confidence below `min_confidence` are dropped.
 
@@ -88,7 +94,9 @@ start as one already created is never created again. Every event created by the 
 (`extendedProperties.private.source = calendar-agent`) and links back to the email.
 
 Weekday names resolve to the **nearest upcoming** day: "next Friday" written on a Wednesday means the
-Friday two days later, not the one after (an early reminder is safer than a missed deadline).
+Friday two days later, not the one after (an early reminder is safer than a missed deadline). Times are read only
+from real clock times ("11:59 PM", "1700 hrs", "2-4 PM", "10 AM to 12 PM"); anything vaguer ("at 5", "EOD") means
+the end of the day for a deadline, never midnight. A submission window is due at its end.
 
 If Ollama isn't running, the affected emails are retried on the next run. To start over, delete
 `state.db` (events already created in Google stay).
@@ -119,9 +127,15 @@ CPUQuota=400%
   planner blocks, the to-dos you Undo, and an event whose task failed to save.
 - `min_free_ram_gb`: if less RAM is free, LLM calls are postponed to the next run (on 26 Sep a full swap plus the
   browser led the kernel to OOM-kill Ollama).
-- `require_gpu`: after an OOM kill Ollama restarted without detecting the NVIDIA GPU and ran the model fully on the
-  CPU (6 GB RAM). If that happens the agent unloads the model, logs `sudo systemctl restart ollama`, and stops calling
-  the model for that run.
+- `require_gpu`: if the GPU isn't available to Ollama (power-saver mode, or Ollama restarted without CUDA after an
+  OOM kill), the model would run on the CPU: slow, hot, 6 GB of RAM. The agent unloads it, alerts you once, and
+  makes **no model calls for 6 hours**: emails wait (they're read later, nothing is lost) and plans use due-date
+  order. It checks whether the model is already loaded on the CPU before running anything. After fixing it
+  (`sudo systemctl restart ollama`, or leaving power-saver mode), tap **Check mail now** to try the GPU again.
+- A model answer that takes longer than `timeout_s` counts against that email (given up after 3 tries, with an
+  alert) instead of costing 5 minutes of GPU on every run. Answers are capped at 700 tokens.
+- **Being offline isn't an error.** A check that can't reach Google or Telegram (Wi-Fi not back after wake-up) logs
+  one line and tries again at the next run. You're only told if there's been no connection for 6 hours.
 
 ## Approving items on your phone (Telegram)
 
@@ -176,12 +190,14 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | `/review` | The calendar review right now: what's new, changed or cancelled on your calendars. |
 | `/check`, **Check mail now** | Runs a mail check immediately instead of waiting for the next 30-minute run. |
 | `/plan`, **Plan rest of today** | Re-plans from now: habits, then work blocks (replaces today's not-yet-started blocks). |
-| `/clear` | Removes today's planner-made blocks (also the **Clear today's plan** button under each plan). |
-| `/pause` | Stops reading mail. Buttons on existing cards still work, and the digest still arrives, noting the pause. |
+| `/clear` | Removes today's planner-made blocks that haven't started (also the **Clear today's plan** button). Blocks already worked stay: later plans count them as done. |
+| `/pause` | Stops reading mail. Your other calendars are still checked, buttons on existing cards still work, and the digest still arrives, noting the pause. |
+| `/skipped` | Emails the pre-filter skipped (no deadline words), newest first, with **Read** buttons to run the model on one anyway. |
 | `/resume` | Starts reading again and checks right away, including all mail that arrived while paused. |
-| `/status` | Paused or on, time of the last mail check, number of cards waiting for you. |
+| `/status` | Health: mail reading on/paused, last mail and calendar checks, today's morning, Google login, GPU, emails waiting for the model, cards waiting, skipped emails, problems in the last 24 h, last backup. |
 
-The button bar at the bottom of the chat appears after `/start` or `/help`. A command sent while the laptop was
+If a tap or command fails (Google unreachable, login expired), the bot says so instead of leaving the card
+unchanged. The button bar at the bottom of the chat appears after `/start` or `/help`. A command sent while the laptop was
 off waits in Telegram and runs when it's back; the bot says it was delayed.
 
 The pause is stored in `state.db` (`meta.paused_since`), so it survives restarts. After changing `approvals.py`,
@@ -200,7 +216,9 @@ summary says the laptop was off. `/plan` re-plans the rest of the day at any tim
 4. **Work**: every deadline (`DUE:` event) and every dated task on your own task lists gets an effort. That's the
    hours you picked on its Telegram card (2-30 h), else `default_effort_hours` (3) or `task_effort_hours` (1). Work
    already done in earlier planner blocks is subtracted, and the rest is spread evenly over the days left, so today
-   gets its share. The **model only ranks** these (it sees days-left and hours computed in Python); if it's
+   gets its share (a deadline at 09:00 or midnight leaves no time on its own day, so that day isn't counted). A
+   to-do shorter than `min_block_minutes` gets a block of its own length ("Call bank 15m" -> 15 min). Blocks that
+   have started count in full. The **model only ranks** these (it sees days-left and hours computed in Python); if it's
    unavailable, the order is earliest due first. Blocks (max `block_minutes`, min `min_block_minutes`) are placed
    earliest-first inside `work_window`, up to `max_work_hours_per_day`.
 5. Summary to Telegram (with **Clear today's plan**) and the desktop. An automatic run with nothing to place stays
@@ -226,7 +244,13 @@ and confirmed with **Undo**. Tap **Done** (or **Nothing today**). After `morning
 answer it goes ahead anyway. Then the day is planned and **one morning message** arrives: today's events, your plan,
 deadlines, and tasks. This replaces the separate 07:00 digest.
 
-- Plain messages count as to-dos only while the check-in is open; at any other time use `/todo`.
+- Plain messages count as to-dos only while the check-in is open; at any other time use `/todo`. Typing
+  "done" or "nothing" works like the buttons. The buttons are dated, so an old one never starts a new day.
+- The day counts as done only when the message has reached **Telegram**. If it couldn't (no Wi-Fi yet), the same
+  message is retried every 15 minutes (the desktop popup isn't repeated). If planning fails, the message still comes,
+  with the reason in place of the plan.
+- If the laptop is first on after `morning.latest_checkin` (18:00), there's no "Good morning" question: it just
+  plans what's left of the day.
 - Telegram keeps messages for 24 h, so `/todo` works while the laptop is off and is added when it's back.
 - Adding tasks straight in the Google Tasks app (due today) also works; the planner reads them, at `task_effort_hours` each.
 - Test the morning now with `python morning.py --start`. `--finish` skips straight to plan + message.
@@ -244,7 +268,7 @@ systemctl --user enable --now calendar-morning.timer
 
 ```bash
 venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-venv/bin/python -m pytest            # ~100 tests, a few seconds, never touches your real accounts
+venv/bin/python -m pytest            # ~190 tests, a few seconds, never touches your real accounts
 git log --oneline                    # history; each phase is one or more commits
 ```
 
@@ -269,7 +293,12 @@ With every mail check the agent also looks at your other Google calendars (`cale
   carries over to the next day's review. Events starting within `urgent_hours` (24) are asked about right
   away instead. `/review` sends the review now.
 - **Changes are asked about again.** A tracked copy follows the original immediately (moved: the copy moves;
-  cancelled: the copy is removed), and the review asks *Still want it? Keep / Remove*. An event you ignored
+  cancelled: the copy is removed), and the review asks *Still want it? Keep / Remove*. A tracked **repeating**
+  event is copied occurrence by occurrence for the next `days_ahead` days, so a single cancelled or moved class is
+  reflected exactly; one moved class isn't reported as a change to the whole series.
+- **A feed hiccup can't delete anything.** An event has to be missing on two checks in a row before its copy is
+  removed, and if it comes back it's restored (tracked again). Copies you tracked keep following their original
+  even after you switch that calendar to *Never ask*, *show* or *ignore*. An event you ignored
   that changes asks *Track now / Keep ignoring*. A deadline made from a calendar event moves with it.
 - Events that look like deadlines (e.g. Moodle's "Assignment 2 is due") also get **It's a deadline**, which makes a DUE event and task, with effort buttons.
 - An event that already came in as an email invite isn't asked about again.
@@ -277,7 +306,8 @@ With every mail check the agent also looks at your other Google calendars (`cale
 - **Nothing is final by accident.** Calendar-wide buttons (Always track calendar, Never ask this calendar) ask
   "Yes / Cancel" first, and afterwards show **Undo**. Track all, Ignore all and It's a deadline also get **Undo**;
   a single Track or Ignore has Untrack / Track instead. Undo removes anything the tap created (copies, the
-  deadline and its task) and brings the cards back.
+  deadline and its task) and brings the cards back, but leaves alone anything you decided differently since.
+  Tapping a button twice never makes a second copy or deadline, and Ignore on a card only affects that card.
 
 The Moodle calendar's name in Google Calendar is its export URL, which contains a private token. The agent only
 ever shows `courses.iiit.ac.in`, never the URL.
