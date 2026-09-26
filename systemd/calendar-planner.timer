@@ -1,0 +1,10 @@
+[Unit]
+Description=Plan the day the first time the laptop is on after 06:45 (checks every 15 min; a no-op once planned)
+
+[Timer]
+OnCalendar=*:0/15
+OnStartupSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

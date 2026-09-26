@@ -1,0 +1,9 @@
+[Unit]
+Description=Calendar agent: plan today's habits and work blocks (once a day)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/calender-agent
+ExecStart=%h/Documents/calender-agent/venv/bin/python planner.py --auto
+Nice=10

@@ -1,0 +1,14 @@
+[Unit]
+Description=Calendar agent: act on Telegram Add / Skip taps
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/calender-agent
+ExecStart=%h/Documents/calender-agent/venv/bin/python approvals.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

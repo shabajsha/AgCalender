@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the calendar agent's mail check every 30 minutes
+
+[Timer]
+OnCalendar=*:00,30
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

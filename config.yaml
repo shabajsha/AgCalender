@@ -1,0 +1,98 @@
+# Calendar agent configuration
+
+# Gmail search used to find forwarded IIITH emails.
+# Default assumes a Gmail filter that applies the label "iiith" to forwarded mail.
+# If you don't have that label, use the fallback instead (put your IIITH address in):
+#   gmail_query: 'subject:FW from:YOUR_IIITH_ADDRESS@students.iiit.ac.in'
+gmail_query: 'label:iiith'
+
+timezone: Asia/Kolkata
+
+# Google Calendar IDs - run `python list_calendars.py` and paste the IDs here.
+calendars:
+  college: '20a9fb4922abd68b7f72dad4a562d4b36b4f37f5cb6b996c014a97ba106b8883@group.calendar.google.com'   # deadlines, classes, meetings from email
+  planner: '038e275cb2e38788ef5fc901c62233d720ccbec938f70d1ad56d377d93e2582e@group.calendar.google.com'
+  habits: '8d23ce0630c1b81d4fa0603ac0073be504ac98a09942ac6c0bffaacb68cc178d@group.calendar.google.com'     # habits (Phase 3)
+
+# --- Ingestion (Phase 1) ---
+ollama:
+  model: gemma2:9b
+  num_ctx: 2048          # prompt+email is ~1-1.7k tokens; 4096 pushed the model partly onto the CPU
+  num_thread: 4          # CPU threads for any layers that don't fit on the GPU (fewer = cooler)
+  keep_alive: 30s        # unload from GPU this long after the last call in a run
+  min_free_ram_gb: 3     # postpone LLM calls when less RAM than this is free (avoids OOM kills)
+  timeout_s: 300
+  require_gpu: true       # if Ollama lost the GPU (runs on CPU only), unload and stop instead of cooking the CPU
+min_confidence: 0.6      # LLM items below this are dropped
+first_run_days: 3        # how far back the very first run looks (use --since to backfill more)
+tasklist: 'eWc5RXUwZk1tZjBoWlVvRg'   # Google Tasks list "College" (created by the agent)
+
+# Ask on Telegram before adding anything (needs telegram_setup.py once, and approvals.py running).
+approval:
+  enabled: true
+  learn_after_skips: 3     # after this many skips (and no adds) from one sender, offer to stop asking
+
+# Emails whose forwarded "From:" line contains any of these are skipped entirely (no LLM, nothing created).
+# The From: line includes the mailing list, e.g. "life@lists.iiit.ac.in ... On Behalf Of gaming club".
+# Wildcards allowed: '*club@students.iiit.ac.in'
+skip_senders:
+  - life@lists.iiit.ac.in      # clubs, fests, events
+
+# An email is sent to the LLM only if its subject/body contains one of these (whole words).
+keywords:
+  - due
+  - deadline
+  - submit
+  - submission
+  - quiz
+  - exam
+  - midsem
+  - endsem
+  - evaluation
+  - viva
+  - meeting
+  - class cancelled
+  - class canceled
+  - rescheduled
+  - lab
+
+# Optional: a URL pinged on every mail check (e.g. a free healthchecks.io check with a Telegram integration).
+# If the pings stop, that service messages you that the laptop is off. Empty = disabled.
+heartbeat_url: ''
+
+# --- Morning digest (Phase 2) ---
+digest:
+  days_ahead: 7
+  channels: [desktop, telegram]   # see notifiers.py; add a channel there to use it here
+
+# --- Morning check-in ---
+morning:
+  checkin: true                # ask for today's to-dos before planning and the morning message
+  wait_minutes: 45             # go ahead without an answer after this long
+  todo_tasklist: 'MDY3MjgzMjQwODkyOTI3NTU4MzQ6MDow'   # "DAILY TASKS"
+  todo_default_minutes: 30     # for to-dos sent without a time
+
+# --- Planner (Phase 3) ---
+planner:
+  plan_after: "06:45"          # auto-plan runs once a day, the first time the laptop is on after this
+  work_window: ["08:00", "23:00"]
+  sleep: ["23:30", "07:00"]    # nothing is ever planned in here (may cross midnight)
+  block_minutes: 90            # work is split into blocks of at most this
+  min_block_minutes: 30
+  gap_minutes: 15              # breathing room around events and between blocks
+  max_work_hours_per_day: 6
+  default_effort_hours: 3      # per deadline, unless you pick another on its Telegram card
+  effort_choices_hours: [2, 4, 8, 12, 20, 30]
+  task_effort_hours: 1         # your own Google Tasks that have a due date
+  horizon_days: 14             # only deadlines within this many days are planned
+
+# Habits are placed before work, inside their window, on the listed days (mon..sun; omit days = every day).
+# Nothing is placed until you add your own. Examples:
+#   - name: Gym
+#     minutes: 60
+#     window: ["06:30", "09:00"]
+#     days: [mon, wed, fri]
+#   - name: Reading
+#     minutes: 30
+#     window: ["21:00", "23:00"]
+habits: []

@@ -1,0 +1,10 @@
+[Unit]
+Description=Calendar agent: read new IIITH mail and ask about new items
+After=network-online.target ollama.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/calender-agent
+ExecStart=%h/Documents/calender-agent/venv/bin/python ingest.py
+Nice=10
+TimeoutStartSec=20min

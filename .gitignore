@@ -1,0 +1,19 @@
+# Secrets - never commit
+credentials*.json
+token.json
+client_secret_*.json
+temp/
+
+# Runtime state
+state.db
+logs/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Telegram bot token + chat id - never commit
+telegram.json
+state.db-journal
+.pytest_cache/

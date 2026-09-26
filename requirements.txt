@@ -1,0 +1,7 @@
+google-api-python-client
+google-auth-oauthlib
+ollama
+pyyaml
+icalendar
+python-dateutil
+requests
