@@ -113,3 +113,58 @@ def event(event_id, start, end, summary, **extra):
 
 def minutes(delta):
     return delta / timedelta(minutes=1)
+
+
+class FakeCalendar:
+    """Just enough of the Google Calendar client for calwatch/google_writer: calendarList().list,
+    events().list/get/insert/patch/delete. `evs` (the `events=` argument) maps calendar id -> list of event dicts (instances),
+    `masters` maps calendar id -> {series id: master event}."""
+
+    def __init__(self, calendars, events=None, masters=None):
+        self.calendars, self.evs, self.masters = calendars, events or {}, masters or {}
+        self.inserted, self.patched, self.deleted, self._n = {}, [], [], 0
+
+    def calendarList(self):
+        return _Lister(lambda: {"items": self.calendars})
+
+    def events(self):
+        return _Events(self)
+
+
+class _Lister:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def list(self, **kwargs):
+        return _Exec(self.fn())
+
+
+class _Events:
+    def __init__(self, fake):
+        self.fake = fake
+
+    def list(self, calendarId, **kwargs):
+        return _Exec({"items": list(self.fake.evs.get(calendarId, []))})
+
+    def get(self, calendarId, eventId):
+        from googleapiclient.errors import HttpError
+        import httplib2
+        pool = self.fake.evs.get(calendarId, []) + list(self.fake.masters.get(calendarId, {}).values())
+        for ev in pool:
+            if ev["id"] == eventId:
+                return _Exec(ev)
+        raise HttpError(httplib2.Response({"status": 404}), b"not found")
+
+    def insert(self, calendarId, body):
+        self.fake._n += 1
+        event_id = f"copy{self.fake._n}"
+        self.fake.inserted[event_id] = (calendarId, body)
+        return _Exec({"id": event_id})
+
+    def patch(self, calendarId, eventId, body):
+        self.fake.patched.append((calendarId, eventId, body))
+        return _Exec({})
+
+    def delete(self, calendarId, eventId):
+        self.fake.deleted.append((calendarId, eventId))
+        return _Exec(None)

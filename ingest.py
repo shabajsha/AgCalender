@@ -12,12 +12,14 @@ import fnmatch
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from googleapiclient.discovery import build
 
 import alerts
 import approvals
+import calwatch
 import google_writer
 import logsetup
 from auth import get_credentials
@@ -25,7 +27,7 @@ from config import load_config
 from extractor import LLMUnavailable, extract_items, matches_keywords
 from gmail_reader import fetch_messages, fingerprint, sender_address
 from ics_import import is_past, parse_ics
-from state import State
+from state import State, dedupe_key
 from telegram_bot import Telegram, TelegramError
 
 log = logging.getLogger("ingest")
@@ -43,13 +45,6 @@ def ping_heartbeat(url):
         requests.get(url, timeout=10)
     except requests.RequestException as e:
         log.warning("heartbeat ping failed (%s)", type(e).__name__)
-
-
-def dedupe_key(item):
-    title = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
-    when = item["due"] or item["start"]
-    stamp = when.isoformat(timespec="minutes") if isinstance(when, datetime) else when.isoformat()
-    return f"{title}|{stamp}"
 
 
 def describe(item):
@@ -78,6 +73,26 @@ def items_for(msg, cfg, now):
         return [], "no-keyword"
     log.info("asking LLM about: %s", msg["subject"])
     return extract_items(msg, cfg["ollama"], cfg["timezone"], cfg["min_confidence"], now), "no-items"
+
+
+def watch_calendars(cfg, state, calendar, tasks, tg, dry_run):
+    """New events on your other calendars -> Track/Ignore cards (calwatch.py). Runs with every mail check."""
+    if not cfg.get("calendar_watch", {}).get("enabled"):
+        return
+    if tg is None and not dry_run:
+        log.info("calendar watch needs Telegram (approval.enabled); skipped")
+        return
+    try:
+        stats = calwatch.Watcher(cfg, state, calendar, tasks, tg, datetime.now(ZoneInfo(cfg["timezone"])),
+                                 dry_run=dry_run).run()
+        log.info("calendars: %d new, %d asked, %d changed, %d cancelled", stats["new"], stats["asked"],
+                 stats["changed"], stats["gone"])
+        if not dry_run:
+            alerts.resolved("calwatch", state)
+    except Exception as e:  # a calendar problem must not stop mail from being read
+        log.exception("calendar watch failed")
+        if not dry_run:
+            alerts.alert("calwatch", f"Checking your other calendars failed ({type(e).__name__}: {e}).", state)
 
 
 @alerts.guard("ingest")
@@ -184,6 +199,8 @@ def main():
                                  f"({type(e).__name__}); skipping it. Please check it yourself.", state)
             else:
                 stats["errors"] += 1
+
+    watch_calendars(cfg, state, calendar, tasks, tg, args.dry_run)
 
     if not args.dry_run:
         if stats["errors"] == 0:

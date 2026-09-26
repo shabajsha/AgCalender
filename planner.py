@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 
 import alerts
+import calwatch
 import google_writer
 import gtasks
 import logsetup
@@ -140,8 +141,13 @@ def _plan_today(cfg, state, now, dry_run, how):
 
     # 2. Free time from now to midnight: minus every calendar's busy time (with gaps) and sleep.
     busy = []
+    policies = {c["id"]: c["policy"] for c in calwatch.load_calendars(cal, cfg, state)}
+    statuses = state.watch_statuses()
     for cid in google_writer.busy_calendar_ids(cal, ["primary", cals["college"], cals["planner"], cals["habits"]]):
-        events = fetch_events(cal, cid, day_start, day_end)
+        if policies.get(cid) == "ignore":
+            continue
+        events = [e for e in fetch_events(cal, cid, day_start, day_end)   # events you tapped Ignore on don't block time
+                  if calwatch.counts_as_busy(policies.get(cid, "internal"), statuses.get((cid, calwatch.event_key(e))))]
         if cid in earlier:
             removed = {b["id"] for b in earlier[cid]} - {b["id"] for b in kept[cid]}
             events = [e for e in events if e["id"] not in removed]

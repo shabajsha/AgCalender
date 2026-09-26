@@ -1,4 +1,5 @@
 """Creates Google Calendar events and Google Tasks from items."""
+from datetime import timedelta
 
 SOURCE_TAG = "calendar-agent"
 DUE_PREFIX = "DUE: "  # deadline events are titled "DUE: <title>"; the digest and planner find them by this
@@ -23,7 +24,8 @@ def create_event(calendar, calendar_id, item, msg, tz_name):
     lines = [f"Course: {item['course']}"] if item.get("course") else []
     if item.get("description"):
         lines.append(item["description"])
-    lines += [f"From email: {msg['subject']}", _gmail_link(msg["id"]), f"(created by {SOURCE_TAG})"]
+    lines += ([f"From email: {msg['subject']}", _gmail_link(msg["id"])] if msg.get("id") else [f"From: {msg['subject']}"])
+    lines.append(f"(created by {SOURCE_TAG})")
 
     body = {
         "summary": event_title(item),
@@ -31,7 +33,7 @@ def create_event(calendar, calendar_id, item, msg, tz_name):
         "start": _when(item["start"], item["all_day"], tz_name),
         "end": _when(item["end"], item["all_day"], tz_name),
         # Lets us find (or wipe) everything this agent created.
-        "extendedProperties": {"private": {"source": SOURCE_TAG, "gmail_id": msg["id"]}},
+        "extendedProperties": {"private": {"source": SOURCE_TAG, "gmail_id": msg.get("id") or ""}},
     }
     if item["type"] == "deadline":
         body["transparency"] = "transparent"  # the 30-min DUE marker isn't busy time
@@ -47,7 +49,7 @@ def create_task(tasks, tasklist, item, msg):
     notes = [f"Due {due:%a %d %b %Y, %H:%M} IST"]
     if item.get("course"):
         notes.append(f"Course: {item['course']}")
-    notes += [f"From email: {msg['subject']}", _gmail_link(msg["id"])]
+    notes += [f"From email: {msg['subject']}", _gmail_link(msg["id"])] if msg.get("id") else [f"From: {msg['subject']}"]
     body = {
         "title": item["title"],
         "notes": "\n".join(notes),
@@ -131,3 +133,39 @@ def busy_calendar_ids(calendar, configured):
         if c.get("selected") and not c.get("hidden") and not c.get("deleted"):
             ids.add(c["id"])
     return sorted(ids)
+
+
+COPY_FIELDS = ("summary", "location", "start", "end", "recurrence")
+
+
+def create_copy(calendar, calendar_id, source, source_label, mirror_key):
+    """Copies another calendar's event (or a repeating series' master) onto `calendar_id`, tagged so the
+    watcher can keep it in step with the original."""
+    body = {k: source[k] for k in COPY_FIELDS if source.get(k)}
+    for side in ("start", "end"):  # keep only what insert accepts
+        body[side] = {k: v for k, v in body[side].items() if k in ("date", "dateTime", "timeZone")}
+    original = (source.get("description") or "").strip()
+    body["description"] = (f"Copied from your {source_label} calendar by {SOURCE_TAG}; it follows changes to the original."
+                           + (f"\n\n{original[:1500]}" if original else ""))
+    body["extendedProperties"] = {"private": {"source": SOURCE_TAG, "kind": "copy", "mirror_of": mirror_key}}
+    return calendar.events().insert(calendarId=calendar_id, body=body).execute()["id"]
+
+
+def update_copy(calendar, calendar_id, copy_id, source):
+    """Brings a copy back in line with its (changed) original."""
+    patch = {k: source[k] for k in COPY_FIELDS if source.get(k)}
+    for side in ("start", "end"):
+        if side in patch:
+            patch[side] = {k: v for k, v in patch[side].items() if k in ("date", "dateTime", "timeZone")}
+    calendar.events().patch(calendarId=calendar_id, eventId=copy_id, body=patch).execute()
+
+
+def move_deadline(calendar, tasks, cfg, event_id, task_id, due):
+    """Moves a DUE event (30 min ending at `due`) and its task to a new due time."""
+    tz = cfg["timezone"]
+    calendar.events().patch(calendarId=cfg["calendars"]["college"], eventId=event_id, body={
+        "start": {"dateTime": (due - timedelta(minutes=30)).isoformat(), "timeZone": tz},
+        "end": {"dateTime": due.isoformat(), "timeZone": tz}}).execute()
+    if task_id:
+        tasks.tasks().patch(tasklist=cfg.get("tasklist", "@default"), task=task_id,
+                            body={"due": f"{due.date().isoformat()}T00:00:00.000Z"}).execute()

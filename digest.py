@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 
 from auth import get_credentials
+import calwatch
 import google_writer
 import gtasks
 import logsetup
@@ -70,16 +71,23 @@ def build_digest(cfg, now, skip_planner_blocks=False):
     tasks = build("tasks", "v1", credentials=creds)
     calendars = {"primary": "primary", **{k: v for k, v in cfg["calendars"].items()}}
 
-    # Today, across all calendars
-    today_lines = []
-    for name, cal_id in calendars.items():
-        for ev in fetch_events(cal, cal_id, day_start, day_start + timedelta(days=1)):
+    # Today, across every calendar you have switched on. Tracked events appear through their College copy;
+    # events still waiting for Track/Ignore are marked; ignored ones and ignored calendars are left out.
+    today_lines, statuses = [], State().watch_statuses()
+    for c in calwatch.load_calendars(cal, cfg, State()):
+        if not c["selected"] or c["policy"] == "ignore":
+            continue
+        for ev in fetch_events(cal, c["id"], day_start, day_start + timedelta(days=1)):
             if skip_planner_blocks and ev.get("extendedProperties", {}).get("private", {}).get("source") == PLANNER_TAG:
+                continue
+            status = statuses.get((c["id"], calwatch.event_key(ev)))
+            if not calwatch.shown_today(c["policy"], status):
                 continue
             start, end, all_day = _event_times(ev, tz)
             when = "all day" if all_day else f"{start:%H:%M}-{end:%H:%M}"
             sort_key = "" if all_day else f"{start:%H:%M}"
-            today_lines.append((sort_key, f"- {when}  {ev.get('summary', '(no title)')}  ({name})"))
+            undecided = "  - not decided yet" if c["policy"] in ("ask", "copy") else ""
+            today_lines.append((sort_key, f"- {when}  {ev.get('summary', '(no title)')}  ({c['label']}){undecided}"))
     today_lines = [line for _, line in sorted(today_lines)] or ["- Nothing scheduled"]
 
     # Deadlines the agent created (DUE: events end at the due time), and work blocks on the planner

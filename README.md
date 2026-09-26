@@ -32,6 +32,7 @@ They are listed in `.gitignore`.
 | `digest.py` | Morning digest: today's events, deadlines in the next 7 days, deadlines with no Planner work block, your own tasks due, items waiting for Add / Skip. `--print` to preview. |
 | `notifiers.py` | Pluggable delivery (`desktop` = notify-send, `telegram`). Add a function to `CHANNELS` for a new channel. |
 | `systemd/` | User units: `calendar-ingest.timer` (every 30 min), `calendar-approvals.service` (always on), `calendar-morning.timer` (check-in, plan, morning message). `calendar-digest.timer` / `calendar-planner.timer` are the older separate versions, now disabled. |
+| `calwatch.py` | Watches your other calendars (timetable, contests, Outlook, Moodle): Track / Ignore cards, copies tracked events into College and keeps them in step with the original. |
 | `alerts.py` | Tells you on Telegram (else desktop) when something needs you: expired Google login, Ollama lost the GPU, repeated mail-check errors, an email given up on. Once per problem per 6 h. |
 | `logsetup.py` | One rotating log file per script in `logs/` (1 MB, 3 kept). |
 | `gtasks.py` | Paged Google Tasks helpers shared by the planner and the digest. |
@@ -171,6 +172,7 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | Command / button | What it does |
 |---|---|
 | `/todo Lab report 2h` | Adds to-dos (one per line, optional time; default 30 min) to DAILY TASKS, due today, with an Undo button. |
+| `/calendars` | Lists your calendars; tap one to cycle ask / copy / show / ignore. |
 | `/check`, **Check mail now** | Runs a mail check immediately instead of waiting for the next 30-minute run. |
 | `/plan`, **Plan rest of today** | Re-plans from now: habits, then work blocks (replaces today's not-yet-started blocks). |
 | `/clear` | Removes today's planner-made blocks (also the **Clear today's plan** button under each plan). |
@@ -247,3 +249,22 @@ git log --oneline                    # history; each phase is one or more commit
 
 If the Google login ever expires (you'll get a Telegram alert), run `venv/bin/python auth.py` in a terminal.
 Background jobs never open a browser themselves; they alert and wait.
+
+## Your other calendars
+
+With every mail check the agent also looks at your other Google calendars (`calendar_watch` in `config.yaml`):
+
+| Policy | What happens to a new event |
+|---|---|
+| `ask` | A Telegram card: **Track** copies it into College, **Ignore** drops it. Repeating events are asked about once per series; a course's two weekly slots are one question; more than 5 new at once become one summary card (Track all / Ignore all / One by one). Until you answer, the event still blocks planning time. |
+| `copy` | Copied into College without asking (the **Always track calendar** button). |
+| `show` | Counted and shown in the digest, never copied (your own calendar, holidays). |
+| `ignore` | Ignored completely (the **Never ask this calendar** button). |
+
+- Tracked copies **follow the original**: if it moves, the copy moves; if it's cancelled, the copy is removed. You get one short "Calendar updates" message about it.
+- Events that look like deadlines (e.g. Moodle's "Assignment 2 is due") also get **It's a deadline**, which makes a DUE event and task, with effort buttons.
+- An event that already came in as an email invite isn't asked about again.
+- `/calendars` shows every calendar's policy and changes it with a tap.
+
+The Moodle calendar's name in Google Calendar is its export URL, which contains a private token. The agent only
+ever shows `courses.iiit.ac.in`, never the URL.

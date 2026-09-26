@@ -60,6 +60,28 @@ keywords:
 # If the pings stop, that service messages you that the laptop is off. Empty = disabled.
 heartbeat_url: ''
 
+# --- Your other calendars ---
+# New events on these get a Track / Ignore card on Telegram (checked with every mail check).
+#   ask    = card per event (one per repeating series); Track copies it into College; until you answer it
+#            still blocks planning time
+#   copy   = copy every event into College without asking   (the "Always track calendar" button)
+#   show   = count it and show it, never copy                (your own calendar, holidays)
+#   ignore = act as if the calendar didn't exist              (the "Never ask this calendar" button)
+# The buttons and /calendars in Telegram override what's written here.
+calendar_watch:
+  enabled: true
+  days_ahead: 14               # ask about events up to this far ahead
+  bulk_after: 5                # more new events than this from one calendar -> one summary card
+  default: ask                 # calendars not listed (e.g. one you subscribe to later)
+  calendars:
+    'ulj2rsi883kp2nf4j1p8lfebc2r7mbvg@import.calendar.google.com': ask     # My IIIT App Timetable
+    'c_9b0d1c817227b09044b85582eb3c10e6a7f4be060a77d15c39bf1fa6f0603d85@group.calendar.google.com': ask   # TLE Contest Tracker
+    '4fm4f23m1nbvgaf7rn613trj656ptvu1@import.calendar.google.com': ask     # Outlook
+    '80j4qref3b58jppmfcfm97rt2d45n8sq@import.calendar.google.com': ask     # Moodle course calendar (courses.iiit.ac.in)
+    'primary': show                                                          # your own calendar
+    'en.indian#holiday@group.v.calendar.google.com': show                   # Holidays in India
+    'family16044744448832549624@group.calendar.google.com': ignore          # Family
+
 # --- Morning digest (Phase 2) ---
 digest:
   days_ahead: 7

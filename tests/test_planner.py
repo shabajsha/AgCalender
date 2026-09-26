@@ -35,6 +35,7 @@ def world(monkeypatch):
     created, deleted = [], []
     monkeypatch.setattr(planner, "fetch_events", lambda cal, cid, s, e: list(events.get(cid, [])))
     monkeypatch.setattr(google_writer, "busy_calendar_ids", lambda cal, configured: configured)
+    monkeypatch.setattr(planner.calwatch, "load_calendars", lambda cal, cfg, state: [])
     monkeypatch.setattr(google_writer, "list_blocks", lambda cal, cid, s, e: [
         x for x in events.get(cid, []) if "extendedProperties" in x])
     monkeypatch.setattr(google_writer, "delete_event", lambda cal, cid, eid: deleted.append(eid))
@@ -91,3 +92,21 @@ def test_second_planner_waits_then_gives_up():
                 pass
     with planner.planning_lock(wait_s=0.3):        # free again afterwards
         pass
+
+
+def test_ignored_calendar_events_do_not_block_time(world, db, monkeypatch):
+    """An event you tapped Ignore on (or a calendar set to ignore) no longer keeps work away from its slot."""
+    world["events"]["tle"] = [event("contest", T(18), T(21), "Codeforces Round")]
+    monkeypatch.setattr(google_writer, "busy_calendar_ids", lambda cal, configured: configured + ["tle"])
+    monkeypatch.setattr(planner.calwatch, "load_calendars",
+                        lambda cal, cfg, state: [{"id": "tle", "policy": "ask", "selected": True}])
+    world["work"][:] = [{"key": "event:x", "title": "Report", "due": T(23, 59), "effort_h": 6}]
+
+    def evening_work():
+        world["created"].clear()
+        planner.plan_today(CFG, db, NOW)
+        return [c for c in world["created"] if c[0] == "work" and c[2] < T(21) and c[3] > T(18)]
+
+    assert evening_work() == []                            # unanswered contest: planner stays away
+    db.watch_add("tle", "contest", False, "Codeforces Round", T(18).isoformat(), {"core": {}}, "ignored")
+    assert evening_work()                                  # ignored: the evening is free for work again

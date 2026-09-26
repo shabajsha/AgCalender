@@ -1,6 +1,7 @@
 """SQLite state (state.db): processed emails, created items, items waiting for your approval, sender choices."""
 import json
 import os
+import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +49,22 @@ CREATE TABLE IF NOT EXISTS plans (
     planned_at TEXT,
     how        TEXT               -- auto / manual / cleared
 );
+CREATE TABLE IF NOT EXISTS watched_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cal_id        TEXT,
+    event_key     TEXT,           -- series id for a repeating event, else the event id
+    is_series     INTEGER,
+    title         TEXT,
+    start         TEXT,           -- next occurrence (ISO datetime or date)
+    snapshot      TEXT,           -- JSON of the source fields, to notice when it changes
+    status        TEXT,           -- pending / tracked / ignored / deadline / linked / gone / expired
+    copy_id       TEXT,           -- its copy on College (tracked) or its DUE event (deadline)
+    tg_message_id INTEGER,
+    batch         INTEGER,        -- summary card it was announced on, if any
+    created_at    TEXT,
+    decided_at    TEXT,
+    UNIQUE (cal_id, event_key)
+);
 CREATE TABLE IF NOT EXISTS failures (
     msg_id     TEXT PRIMARY KEY,  -- an email that raised an error; retried until MAX tries, then given up
     count      INTEGER,
@@ -70,6 +87,14 @@ CREATE TABLE IF NOT EXISTS sender_prefs (
     updated_at TEXT
 );
 """
+
+
+def dedupe_key(item):
+    """Same title (ignoring case/punctuation) at the same minute = the same item, wherever it came from."""
+    title = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
+    when = item.get("due") or item["start"]
+    stamp = when.isoformat(timespec="minutes") if isinstance(when, datetime) else when.isoformat()
+    return f"{title}|{stamp}"
 
 
 def item_to_json(item):
@@ -277,3 +302,55 @@ class State:
     def mark_todos_undone(self, batch):
         self.db.execute("UPDATE todos SET status = 'undone' WHERE batch = ?", (batch,))
         self.db.commit()
+
+    # --- events watched on your other calendars (calwatch.py) ---------------------------------
+
+    WATCH_FIELDS = {"title", "start", "snapshot", "status", "copy_id", "tg_message_id", "batch", "decided_at"}
+
+    def watch_get(self, cal_id, event_key):
+        row = self.db.execute("SELECT * FROM watched_events WHERE cal_id = ? AND event_key = ?", (cal_id, event_key)).fetchone()
+        return dict(row) if row else None
+
+    def watch_row(self, row_id):
+        row = self.db.execute("SELECT * FROM watched_events WHERE id = ?", (row_id,)).fetchone()
+        return dict(row) if row else None
+
+    def watch_add(self, cal_id, event_key, is_series, title, start, snapshot, status, batch=None):
+        cur = self.db.execute(
+            "INSERT INTO watched_events (cal_id, event_key, is_series, title, start, snapshot, status, batch, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (cal_id, event_key, int(is_series), title, start, json.dumps(snapshot), status, batch, _now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def watch_set(self, row_id, **fields):
+        bad = set(fields) - self.WATCH_FIELDS
+        if bad:
+            raise ValueError(f"unknown watched_events fields: {bad}")
+        if "snapshot" in fields and not isinstance(fields["snapshot"], str):
+            fields["snapshot"] = json.dumps(fields["snapshot"])
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self.db.execute(f"UPDATE watched_events SET {cols} WHERE id = ?", (*fields.values(), row_id))
+        self.db.commit()
+
+    def watch_rows(self, cal_id=None, statuses=None, batch=None):
+        sql, args = "SELECT * FROM watched_events WHERE 1=1", []
+        if cal_id is not None:
+            sql, args = sql + " AND cal_id = ?", args + [cal_id]
+        if batch is not None:
+            sql, args = sql + " AND batch = ?", args + [batch]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += list(statuses)
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY start", args)]
+
+    def watch_statuses(self):
+        """{(cal_id, event_key): status} for everything the watcher knows about."""
+        return {(r["cal_id"], r["event_key"]): r["status"] for r in self.db.execute("SELECT cal_id, event_key, status FROM watched_events")}
+
+    def next_watch_batch(self):
+        return (self.db.execute("SELECT COALESCE(MAX(batch), 0) FROM watched_events").fetchone()[0] or 0) + 1
+
+    def pending_or_created(self, dedupe_key):
+        """True if this item already came in by email (card sent or added)."""
+        return self.item_exists(dedupe_key) or self.pending_exists(dedupe_key)

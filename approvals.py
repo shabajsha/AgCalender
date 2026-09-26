@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 
 import alerts
+import calwatch
 import google_writer
 import logsetup
 import morning
@@ -32,7 +33,8 @@ from telegram_bot import Telegram, TelegramError
 LOG_DIR = Path(__file__).parent / "logs"
 EXPIRE_EVERY_S = 600
 COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
-            ("check", "Check mail now instead of waiting for the next 30-min run"),
+            ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
+            ("calendars", "Choose which calendars I ask about, copy, show or ignore"),
             ("plan", "Plan the rest of today (habits + work blocks)"),
             ("clear", "Remove today's planned blocks"),
             ("pause", "Stop reading mail until /resume"),
@@ -99,6 +101,9 @@ class Listener:
             self.tg.answer(cq["id"], "Not allowed")
             return
         action, _, rest = cq.get("data", "").partition(":")
+        if action in ("cal", "calb", "cale", "calp"):  # events from your other calendars (calwatch.py)
+            calwatch.handle_callback(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
+            return
         if action == "checkin":  # "checkin:done" / "checkin:none" under the morning question
             self.checkin_answered(cq, rest)
             return
@@ -140,6 +145,8 @@ class Listener:
                 self.tg.send("Send /todo followed by the task, one per line, e.g.\n/todo Lab report 2h\nCall bank 15m")
         elif not text.startswith("/") and not LABELS.get(text.lower()) and morning.checkin_open(self.state, today):
             self.add_todos(text, today)
+        elif command == "/calendars":
+            calwatch.show_menu(self, datetime.now(ZoneInfo(self.cfg["timezone"])))
         elif command == "/check":
             if self.state.paused_since():
                 self.tg.send("Mail reading is paused, so nothing was checked. Tap Resume (or send /resume) first.")
