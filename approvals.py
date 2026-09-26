@@ -100,8 +100,11 @@ class Listener:
             log.warning("ignored a tap from unknown chat %s", chat_id)
             self.tg.answer(cq["id"], "Not allowed")
             return
+        # Answer at once so the button stops spinning; slow Google calls come after. (Answering late made
+        # Telegram reject the tap and let taps pile up behind each other.)
+        self.tg.answer(cq["id"])
         action, _, rest = cq.get("data", "").partition(":")
-        if action in ("cal", "calb", "cale", "calp"):  # events from your other calendars (calwatch.py)
+        if action in ("cal", "calb", "cale", "calp", "calc", "calu"):  # events from your other calendars (calwatch.py)
             calwatch.handle_callback(self, cq, action, rest, datetime.now(ZoneInfo(self.cfg["timezone"])))
             return
         if action == "checkin":  # "checkin:done" / "checkin:none" under the morning question

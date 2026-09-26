@@ -102,3 +102,10 @@ def test_commands(bot, tg, db):
     assert "laptop was off or asleep" in tg.sent[-2]["text"]
     say(bot, "/start")
     assert tg.sent[-1]["keyboard"] == approvals.KEYBOARD
+
+
+def test_every_tap_is_answered_before_the_slow_work(bot, tg, db, monkeypatch):
+    seen = []
+    monkeypatch.setattr(approvals.calwatch, "handle_callback", lambda *a: seen.append(list(tg.answers)))
+    tap(bot, "cal:t:1")
+    assert seen == [[""]]            # the spinner was stopped before calwatch started its Google calls

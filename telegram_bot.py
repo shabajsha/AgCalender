@@ -68,8 +68,12 @@ class Telegram:
                 raise
 
     def answer(self, callback_id, text=""):
-        """Stops the spinner on a tapped button (and shows a short toast)."""
-        self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+        """Stops the spinner on a tapped button (and shows a short toast). The listener answers every tap
+        immediately, so a later answer for the same tap fails; that's harmless and ignored."""
+        try:
+            self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+        except TelegramError:
+            pass
 
     def updates(self, offset=None, wait=50):
         """Long-polls: returns as soon as there is a tap, or after `wait` seconds with []."""

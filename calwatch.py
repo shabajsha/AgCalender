@@ -13,6 +13,7 @@ about both in one short "Calendar updates" message.
 import json
 import logging
 import re
+import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urlparse
@@ -48,12 +49,26 @@ def label(entry):
     return name
 
 
+_ENTRY_CACHE = {}  # id(client) -> (monotonic time, client, entries)
+ENTRY_CACHE_S = 300
+
+
+def _calendar_entries(cal):
+    """calendarList, cached for a few minutes per client so each button press doesn't cost a Google call."""
+    hit = _ENTRY_CACHE.get(id(cal))
+    if hit and hit[1] is cal and time_module.monotonic() - hit[0] < ENTRY_CACHE_S:
+        return hit[2]
+    entries = cal.calendarList().list(maxResults=250, showHidden=True).execute().get("items", [])
+    _ENTRY_CACHE[id(cal)] = (time_module.monotonic(), cal, entries)
+    return entries
+
+
 def load_calendars(cal, cfg, state):
     """[{id, key, label, policy, selected}] for every calendar in your list; the agent's own are 'internal'."""
     wc = cfg.get("calendar_watch", {})
     configured, own = wc.get("calendars") or {}, set(cfg["calendars"].values())
     out = []
-    for entry in cal.calendarList().list(maxResults=250, showHidden=True).execute().get("items", []):
+    for entry in _calendar_entries(cal):
         key = "primary" if entry.get("primary") else entry["id"]
         if entry["id"] in own:
             policy = "internal"
@@ -281,20 +296,8 @@ class Watcher:
 
     def _bulk_card(self, c, rows):
         batch = self.state.next_watch_batch()
-        groups = group_rows(rows)
-        repeating = sum(1 for g in groups if g[0]["is_series"])
-        lines = [f"{c['label']}: {len(groups)} new event{'s' if len(groups) != 1 else ''}"
-                 + (f" ({repeating} repeating)" if repeating else "")]
-        for g in groups[:BULK_LIST]:
-            when = group_repeats(g) if g[0]["is_series"] else json.loads(g[0]["snapshot"])["when"]
-            lines.append(f"- {clean_text(g[0]['title'], 80)}: {when}")
-        if len(groups) > BULK_LIST:
-            lines.append(f"...and {len(groups) - BULK_LIST} more")
-        lines.append("\nTrack all = copy them into College. Until you decide, they still block planning time.")
-        buttons = [[("Track all", f"calb:t:{batch}"), ("Ignore all", f"calb:i:{batch}")],
-                   [("One by one", f"calb:o:{batch}")],
-                   [("Always track calendar", f"calb:A:{batch}"), ("Never ask this calendar", f"calb:N:{batch}")]]
-        message_id = self.tg.send("\n".join(lines), buttons)
+        text, buttons = render_bulk(self, rows, batch)
+        message_id = self.tg.send(text, buttons)
         for r in rows:
             self.state.watch_set(r["id"], batch=batch, tg_message_id=message_id)
         self.stats["asked"] += len(rows)
@@ -408,34 +411,149 @@ class Watcher:
 
 # --- Telegram button handling (called by the listener) ---------------------------------------------
 
+def render_bulk(w, rows, batch):
+    """Text and buttons of a summary card for the still-undecided `rows` of `batch`."""
+    groups = group_rows(rows)
+    repeating = sum(1 for g in groups if g[0]["is_series"])
+    lines = [f"{w._label(rows[0]['cal_id'])}: {len(groups)} new event{'s' if len(groups) != 1 else ''}"
+             + (f" ({repeating} repeating)" if repeating else "")]
+    for g in groups[:BULK_LIST]:
+        when = group_repeats(g) if g[0]["is_series"] else json.loads(g[0]["snapshot"])["when"]
+        lines.append(f"- {clean_text(g[0]['title'], 80)}: {when}")
+    if len(groups) > BULK_LIST:
+        lines.append(f"...and {len(groups) - BULK_LIST} more")
+    lines.append("\nTrack all = copy them into College. Until you decide, they still block planning time.")
+    buttons = [[("Track all", f"calb:t:{batch}"), ("Ignore all", f"calb:i:{batch}")],
+               [("One by one", f"calb:o:{batch}")],
+               [("Always track calendar", f"calb:A:{batch}"), ("Never ask this calendar", f"calb:N:{batch}")]]
+    return "\n".join(lines), buttons
+
+
 def _decided_text(w, rows, outcome):
     rows = rows if isinstance(rows, list) else [rows]
     return card_text(w._label(rows[0]["cal_id"]), [w.state.watch_row(r["id"]) for r in rows]) + f"\n\n{outcome}"
 
 
+def _rerender(w, row_ids, skip_message=None):
+    """Redraw every card these rows appear on, after Undo or a calendar-wide change: one edit per message."""
+    rows = [w.state.watch_row(i) for i in row_ids]
+    done = {skip_message}
+    for r in rows:
+        mid = r["tg_message_id"]
+        if not mid or mid in done:
+            continue
+        done.add(mid)
+        if r["batch"]:
+            waiting = w.state.watch_rows(batch=r["batch"], statuses=["pending"])
+            if waiting:
+                w.tg.edit(mid, *render_bulk(w, waiting, r["batch"]))
+            else:
+                counts = Counter(x["status"] for x in w.state.watch_rows(batch=r["batch"]))
+                w.tg.edit(mid, f"{w._label(r['cal_id'])}: " + ", ".join(f"{n} {st}" for st, n in counts.items()) + ".")
+            continue
+        group = [x for x in rows if x["tg_message_id"] == mid] or [r]
+        if all(x["status"] == "pending" for x in group):
+            w.tg.edit(mid, card_text(w._label(r["cal_id"]), group),
+                      card_buttons(group[0], json.loads(group[0]["snapshot"]).get("deadline_like")))
+        else:
+            w.tg.edit(mid, _decided_text(w, group, {"tracked": "Tracked: copied into College.", "ignored": "Ignored.",
+                                                    "deadline": "Added as a deadline."}.get(group[0]["status"], "")))
+
+
+def _save_undo(state, record):
+    n = int(state.get_meta("calundo_seq") or 0) + 1
+    state.set_meta("calundo_seq", str(n))
+    state.set_meta(f"calundo:{n}", json.dumps(record))
+    return n
+
+
+def _undo(w, n):
+    """Puts rows (and the calendar's setting) back as they were before one button press, removing any
+    copies or deadlines that press created. Returns the restored row ids, or None if already undone."""
+    raw = w.state.get_meta(f"calundo:{n}")
+    if not raw:
+        return None
+    rec = json.loads(raw)
+    if rec.get("policy") is not None:
+        key = w.by_id[rec["cal_id"]]["key"] if rec["cal_id"] in w.by_id else rec["cal_id"]
+        w.state.set_meta(f"calpolicy:{key}", rec["policy"])  # "" = back to what config.yaml says
+    for row_id, status, copy_id in rec["rows"]:
+        row = w.state.watch_row(row_id)
+        if row["status"] == "tracked" and row["copy_id"] and row["copy_id"] != copy_id:
+            google_writer.delete_event(w.cal, w.college, row["copy_id"])
+        elif row["status"] == "deadline" and row["copy_id"]:
+            task_id = w.state.task_for_event(row["copy_id"])
+            google_writer.delete_event(w.cal, w.college, row["copy_id"])
+            if task_id:
+                try:
+                    w.tasks.tasks().delete(tasklist=w.cfg.get("tasklist", "@default"), task=task_id).execute()
+                except HttpError as e:
+                    if e.resp.status not in (404, 410):
+                        raise
+            w.state.delete_item_by_event(row["copy_id"])
+        w.state.watch_set(row_id, status=status, copy_id=copy_id, decided_at=None)
+    w.state.set_meta(f"calundo:{n}", "")  # one Undo per press
+    return [r[0] for r in rec["rows"]]
+
+
+def _snapshot_rows(rows):
+    return [[r["id"], r["status"], r["copy_id"]] for r in rows]
+
+
 def handle_callback(listener, cq, action, rest, now):
-    """cal:<op>:<row> (one event), calb:<op>:<batch> (summary card), cale:<row>:<hours> (deadline effort),
-    calp:<index> (/calendars menu)."""
+    """cal:<op>:<row>  one event        calb:<op>:<batch>  summary card     cale:<row>:<hours>  deadline effort
+    calc:<op>:<ref>  confirm/cancel a calendar-wide change (ref = r<row> or b<batch>)
+    calu:<n>         undo                                  calp:<index>  /calendars menu"""
     w = Watcher(listener.cfg, listener.state, listener.calendar, listener.tasks, listener.tg, now)
     tg, state, message_id = listener.tg, listener.state, cq["message"]["message_id"]
+    log.info("calendar button %s:%s", action, rest)
 
     if action == "calp":
         return _cycle_policy(w, cq, rest)
+
+    if action == "calu":
+        restored = _undo(w, int(rest)) if rest.isdigit() else None
+        if restored is None:
+            tg.edit(message_id, "Already undone.")
+            return
+        _rerender(w, restored)
+        log.info("undid calendar change %s (%d events restored)", rest, len(restored))
+        return
+
+    if action == "calc":  # the answer to "Stop asking about ...?" / "Copy everything from ...?"
+        op, _, ref = rest.partition(":")
+        rows = _ref_rows(state, ref)
+        if not rows:
+            tg.edit(message_id, "Nothing left to change here.")
+            return
+        cal_id = rows[0]["cal_id"]
+        if op == "x":
+            _rerender(w, [r["id"] for r in (state.watch_rows(batch=int(ref[1:])) if ref[0] == "b" else rows)])
+            return
+        policy = "copy" if op == "A" else "ignore"
+        key = w.by_id[cal_id]["key"] if cal_id in w.by_id else cal_id
+        before = state.watch_rows(cal_id=cal_id, statuses=["pending"])
+        undo = _save_undo(state, {"cal_id": cal_id, "policy": state.get_meta(f"calpolicy:{key}") or "",
+                                  "rows": _snapshot_rows(before)})
+        _apply_policy_to_calendar(w, cal_id, policy, skip_message=message_id)
+        label_ = w._label(cal_id)
+        tg.edit(message_id, (f"{label_}: every event will be copied into College from now on"
+                             f" ({len(before)} waiting event(s) copied)." if policy == "copy" else
+                             f"{label_}: I won't ask about this calendar again ({len(before)} waiting event(s) ignored)."),
+                [[("Undo", f"calu:{undo}")]])
+        log.info("calendar %s set to %s", label_, policy)
+        return
+
     if action == "calb":
         op, _, raw = rest.partition(":")
         rows = state.watch_rows(batch=int(raw), statuses=["pending"]) if raw.isdigit() else []
         if not rows:
-            tg.answer(cq["id"], "Already handled")
+            tg.edit(message_id, "Already handled.")
             return
-        c_label, cal_id = w._label(rows[0]["cal_id"]), rows[0]["cal_id"]
-        if op == "t":
-            done = sum(1 for r in rows if w.track(r))
-            tg.edit(message_id, f"{c_label}: tracked {done} event(s); copied into College.")
-        elif op == "i":
-            for r in rows:
-                w.ignore(r)
-            tg.edit(message_id, f"{c_label}: ignored {len(rows)} event(s).")
-        elif op == "o":
+        c_label = w._label(rows[0]["cal_id"])
+        if op in ("A", "N"):
+            return _confirm(w, message_id, rows[0]["cal_id"], op, f"b{raw}")
+        if op == "o":
             groups = group_rows(rows)
             for g in groups[:MAX_ONE_BY_ONE]:
                 w._send_card(g)
@@ -443,28 +561,29 @@ def handle_callback(listener, cq, action, rest, now):
             tg.edit(message_id, f"{c_label}: sent {min(len(groups), MAX_ONE_BY_ONE)} one by one below."
                     + (f" {left} more are waiting; tap One by one again." if left > 0 else ""),
                     [[("One by one", f"calb:o:{raw}")]] if left > 0 else None)
-        elif op in ("A", "N"):
-            _apply_policy_to_calendar(w, cal_id, "copy" if op == "A" else "ignore")
-            tg.edit(message_id, f"{c_label}: " + ("every event will be copied into College from now on."
-                                                  if op == "A" else "I won't ask about this calendar again."))
-        tg.answer(cq["id"], "Done")
+            return
+        undo = _save_undo(state, {"cal_id": rows[0]["cal_id"], "policy": None, "rows": _snapshot_rows(rows)})
+        if op == "t":
+            done = sum(1 for r in rows if w.track(r))
+            tg.edit(message_id, f"{c_label}: tracked {done} event(s); copied into College.", [[("Undo", f"calu:{undo}")]])
+        elif op == "i":
+            for r in rows:
+                w.ignore(r)
+            tg.edit(message_id, f"{c_label}: ignored {len(rows)} event(s).", [[("Undo", f"calu:{undo}")]])
         return
 
     if action == "cale":  # effort for a deadline made from a calendar event
         raw_id, _, hours = rest.partition(":")
         row = state.watch_row(int(raw_id)) if raw_id.isdigit() else None
         if not row or not row["copy_id"]:
-            tg.answer(cq["id"], "Unknown item")
             return
         state.set_effort(f"event:{row['copy_id']}", float(hours))
         tg.edit(message_id, _decided_text(w, row, f"Added as a deadline. Work needed: {float(hours):g} h"))
-        tg.answer(cq["id"], f"{float(hours):g} h")
         return
 
     op, _, raw_id = rest.partition(":")
     row = state.watch_row(int(raw_id)) if raw_id.isdigit() else None
     if row is None:
-        tg.answer(cq["id"], "Unknown item")
         return
     if op == "t":
         group = siblings(state, row, ["pending", "ignored"])
@@ -479,36 +598,56 @@ def handle_callback(listener, cq, action, rest, now):
         tg.edit(message_id, _decided_text(w, group, "Untracked: the College copy was removed." if op == "u" else "Ignored."),
                 [[("Track instead", f"cal:t:{row['id']}")]])
     elif op == "d":
+        undo = _save_undo(state, {"cal_id": row["cal_id"], "policy": None, "rows": _snapshot_rows([row])})
         if w.as_deadline(row) is None:
             tg.edit(message_id, _decided_text(w, row, "That event no longer exists; nothing was added."))
         else:
             row = state.watch_row(row["id"])
             choices = [(f"{h:g} h", f"cale:{row['id']}:{h}") for h in listener.cfg["planner"]["effort_choices_hours"]]
             tg.edit(message_id, _decided_text(w, row, "Added as a deadline (calendar event + task). How much work does it need?"),
-                    [choices[:3], choices[3:]])
+                    [choices[:3], choices[3:], [("Undo", f"calu:{undo}")]])
     elif op in ("A", "N"):
-        _apply_policy_to_calendar(w, row["cal_id"], "copy" if op == "A" else "ignore")
-        row = state.watch_row(row["id"])
-        tg.edit(message_id, _decided_text(w, row, "Every event from this calendar will be copied into College from now on."
-                                          if op == "A" else "I won't ask about this calendar again."))
+        _confirm(w, message_id, row["cal_id"], op, f"r{row['id']}")
+    log.info("calendar %s on %r (%s)", {"t": "track", "i": "ignore", "u": "untrack", "d": "deadline",
+                                        "A": "always-track?", "N": "never-ask?"}.get(op, op), row["title"], w._label(row["cal_id"]))
+
+
+def _ref_rows(state, ref):
+    if ref[:1] == "r" and ref[1:].isdigit():
+        row = state.watch_row(int(ref[1:]))
+        return siblings(state, row, ["pending"]) if row and row["status"] == "pending" else []
+    if ref[:1] == "b" and ref[1:].isdigit():
+        return state.watch_rows(batch=int(ref[1:]), statuses=["pending"])
+    return []
+
+
+def _confirm(w, message_id, cal_id, op, ref):
+    """Calendar-wide buttons touch many events, so they ask once more (a misclick used to be final)."""
+    waiting = len(w.state.watch_rows(cal_id=cal_id, statuses=["pending"]))
+    label_ = w._label(cal_id)
+    if op == "N":
+        text = (f"Stop asking about {label_}?\nIts {waiting} waiting event(s) will be ignored, and new ones won't "
+                "be asked about. You can undo this, or change it later with /calendars.")
+        yes = "Yes, never ask"
     else:
-        tg.answer(cq["id"], "Unknown button")
-        return
-    tg.answer(cq["id"], "Done")
+        text = (f"Copy every event from {label_} into College from now on?\nIts {waiting} waiting event(s) will be "
+                "copied too. You can undo this, or change it later with /calendars.")
+        yes = "Yes, always copy"
+    w.tg.edit(message_id, text, [[(yes, f"calc:{op}:{ref}"), ("Cancel", f"calc:x:{ref}")]])
 
 
-def _apply_policy_to_calendar(w, cal_id, policy):
-    """Always track -> copy this calendar's waiting events too; Never ask -> ignore them."""
+def _apply_policy_to_calendar(w, cal_id, policy, skip_message=None):
+    """Always track -> copy this calendar's waiting events too; Never ask -> ignore them. Each affected card is
+    edited once."""
     w.set_policy(cal_id, policy)
+    touched = []
     for r in w.state.watch_rows(cal_id=cal_id, statuses=["pending"]):
         if policy == "copy":
             w.track(r)
         else:
             w.ignore(r)
-        if r["tg_message_id"] and not r["batch"]:
-            fresh = w.state.watch_row(r["id"])
-            w.tg.edit(r["tg_message_id"], _decided_text(w, fresh, "Tracked (whole calendar)." if policy == "copy"
-                                                        else "Ignored (whole calendar)."))
+        touched.append(r["id"])
+    _rerender(w, touched, skip_message=skip_message)
 
 
 # --- /calendars -------------------------------------------------------------------------------------

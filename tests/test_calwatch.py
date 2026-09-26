@@ -126,6 +126,9 @@ def test_bulk_track_all(setup):
 def test_never_ask_this_calendar(setup):
     watch(setup)
     tap(setup, "calb:N:1")
+    assert setup.db.get_meta(f"calpolicy:{TLE}") is None                     # asks first
+    assert setup.tg.edits[500]["buttons"] == [[("Yes, never ask", "calc:N:b1"), ("Cancel", "calc:x:b1")]]
+    tap(setup, "calc:N:b1")
     assert setup.db.get_meta(f"calpolicy:{TLE}") == "ignore"
     assert all(s == "ignored" for (c, _), s in setup.db.watch_statuses().items() if c == TLE)
     setup.cal.evs[TLE].append(event("c99", h(200), h(202), "Codeforces Round 999"))
@@ -136,7 +139,9 @@ def test_never_ask_this_calendar(setup):
 
 def test_always_track_calendar_copies_future_events(setup):
     watch(setup)
-    tap(setup, f"cal:A:{row_for(setup, OUTLOOK, 'm1')['id']}")
+    row_id = row_for(setup, OUTLOOK, "m1")["id"]
+    tap(setup, f"cal:A:{row_id}")
+    tap(setup, f"calc:A:r{row_id}")
     assert setup.db.get_meta(f"calpolicy:{OUTLOOK}") == "copy"
     setup.cal.evs[OUTLOOK].append(event("m2", h(30), h(31), "Faculty meeting"))
     watch(setup)
@@ -202,3 +207,51 @@ def test_two_weekly_slots_of_a_course_are_one_question(setup):
     tap(setup, cards[0]["buttons"][0][0][1], message_id=cards[0]["id"])
     copies = [body for cid, body in setup.cal.inserted.values() if body["summary"] == "EC4.401 - Robotics"]
     assert len(copies) == 2 and all(b["recurrence"] for b in copies)
+
+
+def test_undo_never_ask_restores_everything(setup):
+    watch(setup)
+    rows = [row_for(setup, OUTLOOK, k) for k in ("m1", "s1")]
+    tap(setup, f"cal:N:{rows[0]['id']}", message_id=rows[0]["tg_message_id"])
+    tap(setup, f"calc:N:r{rows[0]['id']}", message_id=rows[0]["tg_message_id"])
+    assert all(row_for(setup, OUTLOOK, k)["status"] == "ignored" for k in ("m1", "s1"))
+    undo = setup.tg.edits[rows[0]["tg_message_id"]]["buttons"][0][0][1]
+    assert undo.startswith("calu:")
+    tap(setup, undo, message_id=rows[0]["tg_message_id"])
+    assert setup.db.get_meta(f"calpolicy:{OUTLOOK}") == ""                   # back to config.yaml ("ask")
+    assert all(row_for(setup, OUTLOOK, k)["status"] == "pending" for k in ("m1", "s1"))
+    for r in rows:                                                            # cards are live again
+        assert setup.tg.edits[r["tg_message_id"]]["buttons"][0] == [("Track", f"cal:t:{r['id']}"), ("Ignore", f"cal:i:{r['id']}")]
+    tap(setup, undo)
+    assert setup.tg.edits[500]["text"] == "Already undone."
+
+
+def test_cancel_leaves_the_card_as_it_was(setup):
+    watch(setup)
+    row = row_for(setup, OUTLOOK, "m1")
+    tap(setup, f"cal:N:{row['id']}", message_id=row["tg_message_id"])
+    tap(setup, f"calc:x:r{row['id']}", message_id=row["tg_message_id"])
+    assert setup.db.get_meta(f"calpolicy:{OUTLOOK}") is None
+    assert setup.tg.edits[row["tg_message_id"]]["buttons"][0][0] == ("Track", f"cal:t:{row['id']}")
+
+
+def test_undo_track_all_removes_the_copies(setup):
+    watch(setup)
+    tap(setup, "calb:t:1")
+    assert len(setup.cal.inserted) == 7
+    tap(setup, setup.tg.edits[500]["buttons"][0][0][1])
+    assert len(setup.cal.deleted) == 7
+    assert all(s == "pending" for (c, _), s in setup.db.watch_statuses().items() if c == TLE)
+    assert setup.tg.edits[setup.db.watch_rows(cal_id=TLE)[0]["tg_message_id"]]["text"].startswith("TLE Contest Tracker: 7 new")
+
+
+def test_undo_deadline_removes_event_and_task(setup):
+    setup.cal.evs[MOODLE] = [event("a2", h(60), h(60), "Assignment 2 is due")]
+    watch(setup)
+    row = row_for(setup, MOODLE, "a2")
+    tap(setup, f"cal:d:{row['id']}")
+    due_id = row_for(setup, MOODLE, "a2")["copy_id"]
+    assert setup.tasks.store and setup.db.task_for_event(due_id)
+    tap(setup, setup.tg.edits[500]["buttons"][-1][0][1])                     # the Undo row
+    assert (COLLEGE, due_id) in setup.cal.deleted and setup.tasks.store == {}
+    assert row_for(setup, MOODLE, "a2")["status"] == "pending" and setup.db.task_for_event(due_id) is None

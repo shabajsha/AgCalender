@@ -354,3 +354,8 @@ class State:
     def pending_or_created(self, dedupe_key):
         """True if this item already came in by email (card sent or added)."""
         return self.item_exists(dedupe_key) or self.pending_exists(dedupe_key)
+
+    def delete_item_by_event(self, event_id):
+        """Forget a created item (used when a deadline is undone), so it could be added again later."""
+        self.db.execute("DELETE FROM created_items WHERE event_id = ?", (event_id,))
+        self.db.commit()

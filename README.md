@@ -265,6 +265,10 @@ With every mail check the agent also looks at your other Google calendars (`cale
 - Events that look like deadlines (e.g. Moodle's "Assignment 2 is due") also get **It's a deadline**, which makes a DUE event and task, with effort buttons.
 - An event that already came in as an email invite isn't asked about again.
 - `/calendars` shows every calendar's policy and changes it with a tap.
+- **Nothing is final by accident.** Calendar-wide buttons (Always track calendar, Never ask this calendar) ask
+  "Yes / Cancel" first, and afterwards show **Undo**. Track all, Ignore all and It's a deadline also get **Undo**;
+  a single Track or Ignore has Untrack / Track instead. Undo removes anything the tap created (copies, the
+  deadline and its task) and brings the cards back.
 
 The Moodle calendar's name in Google Calendar is its export URL, which contains a private token. The agent only
 ever shows `courses.iiit.ac.in`, never the URL.
