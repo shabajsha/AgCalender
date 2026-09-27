@@ -29,6 +29,8 @@ import google_writer
 import llm
 import logsetup
 import morning
+import planner
+import slotpicker
 import todos
 from auth import AuthExpired, get_credentials
 from ics_import import describe_recurrence
@@ -41,9 +43,10 @@ EXPIRE_EVERY_S = 600
 COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
             ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
             ("skipped", "Emails I skipped (no deadline words), with a button to read one anyway"),
+            ("exams", "Exams coming up and how much preparation each gets"),
             ("calendars", "Choose which calendars I ask about, copy, show or ignore"),
             ("review", "Calendar review now: what's new or changed on your calendars"),
-            ("plan", "Plan the rest of today (habits + work blocks)"),
+            ("plan", "Rest of today: free slots to pick for each task"),
             ("clear", "Remove today's planned blocks that haven't started"),
             ("pause", "Stop reading mail until /resume (calendar checks continue)"),
             ("resume", "Start reading mail again (checks right away)"),
@@ -54,7 +57,9 @@ LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "
           "pause": "/pause", "resume": "/resume"}
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
-SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo"}
+SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo",
+                "sgb", "sgm", "sgn", "bkd", "eve", "prep"}
+SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep")  # slotpicker.py: times, "Did you finish?", evening, exams
 # Typed instead of tapping the check-in buttons (a whole message, after lowercasing and trimming punctuation).
 DONE_WORDS = {"done", "finished", "that's all", "thats all", "that's it", "thats it", "all done", "ok", "okay"}
 NONE_WORDS = {"nothing", "nothing today", "no", "none", "nope", "no tasks", "nil"}
@@ -71,6 +76,8 @@ def format_item(item, subject, sender):
     when = _when(item)
     stamp = when.strftime("%a %d %b, %H:%M") if isinstance(when, datetime) else when.strftime("%a %d %b (all day)")
     kind = {"deadline": "Deadline", "meeting": "Meeting", "event": "Event"}[item["type"]]
+    if item["type"] != "deadline" and planner.exam_kind(item["title"]):
+        kind = "Exam"
     lines = [f"{kind}: {item['title']}", stamp]
     if item.get("course"):
         lines.append(f"Course: {item['course']}")
@@ -79,6 +86,8 @@ def format_item(item, subject, sender):
     lines += [f"From: {sender}", f"Email: {subject}"]
     if item["type"] == "deadline":
         lines.append("Add = calendar event + task")
+    elif kind == "Exam":
+        lines.append("Add = calendar event, with preparation time planned before it")
     return "\n".join(lines)
 
 
@@ -152,6 +161,9 @@ class Listener:
         if action in ("crv", "crva"):  # the daily calendar review and "changed" cards
             calwatch.handle_review(self, cq, action, rest, datetime.now(self._tz()))
             return
+        if action in SLOT_ACTIONS:
+            slotpicker.handle(self, cq, action, rest, datetime.now(self._tz()))
+            return
         if action in ("cal", "calb", "cale", "calc", "calu", "calp"):  # events from your other calendars
             calwatch.handle_callback(self, cq, action, rest, datetime.now(self._tz()))
             return
@@ -212,6 +224,8 @@ class Listener:
             self.add_todos(text, today)
         elif command == "/skipped":
             self.show_skipped()
+        elif command == "/exams":
+            self.tg.send(*slotpicker.exams_message(self.cfg, self.state, datetime.now(self._tz()), self.calendar))
         elif command == "/review":
             started = self._run_script("morning.py", "--review", unit="calendar-review-now")
             self.tg.send("Looking at your calendars; the review follows shortly." if started is True else
@@ -231,8 +245,8 @@ class Listener:
                 self.tg.send("Couldn't start the mail check (is calendar-ingest.service installed?).")
         elif command == "/plan":
             started = self._run_planner()
-            self.tg.send("Planning the rest of today; the plan will arrive here shortly." if started is True else
-                         "Already planning; the plan will arrive shortly." if started == "busy" else
+            self.tg.send("Finding your free slots for the rest of today; pick a time for each task below." if started is True else
+                         "Already on it; the times will arrive shortly." if started == "busy" else
                          "Couldn't start the planner.")
         elif command == "/clear":
             started = self._run_planner("--clear")
@@ -280,6 +294,10 @@ class Listener:
         if waiting:
             lines.append(f"Emails waiting for the model: {waiting}")
         lines.append(f"Cards waiting for your answer: {state.count_open_pending()}")
+        items = state.plan_items(now.date())
+        if items:
+            waiting_time = sum(1 for r in items if r["status"] == "open" and r["minutes"] > 0)
+            lines.append(f"Today's tasks: {len(items) - waiting_time} with a time (or not today), {waiting_time} waiting for a time")
         skipped = state.skipped_messages(limit=50, since=now - timedelta(days=1))
         if skipped:
             lines.append(f"Emails skipped in the last 24 h (no deadline words): {len(skipped)} - /skipped")
@@ -344,8 +362,12 @@ class Listener:
         buttons = [("Undo", f"undo:{batch}")]
         if morning.checkin_open(self.state, today):
             tail, buttons = "Anything else? Tap Done (or type done) when you're finished.", buttons + [morning.checkin_buttons(today)[0]]
+        elif self.state.get_meta(morning.MORNING_SENT) == today.isoformat():
+            started = self._run_script("planner.py", "--suggest-new", unit="calendar-suggest-now")
+            tail = ("Free slots to pick for it follow in a moment." if started is True else
+                    "Tap 'Plan rest of today' to get free slots for it.")
         else:
-            tail = "Tap 'Plan rest of today' to fit it into today's plan."
+            tail = "You'll get free slots for it after the morning check-in."
         self.tg.send("Added to DAILY TASKS (due today):\n" + "\n".join(lines) + "\n\n" + tail, buttons)
         log.info("added %d to-do(s)", len(added))
 
@@ -430,11 +452,17 @@ class Listener:
                                str(_when(item)), row["msg_id"])
         self.state.set_pending_status(row["id"], "added")
         text = self._card(row) + "\n\nAdded to your calendar" + (" and tasks" if task_id else "")
+        exam = item["type"] != "deadline" and planner.exam_kind(item["title"])
         if item["type"] == "deadline":
             pc = self.cfg["planner"]
             choices = [(f"{h:g} h", f"effort:{row['id']}:{h}") for h in pc["effort_choices_hours"]]
             self.tg.edit(row["tg_message_id"], text + f"\nHow much work does it need? (default {pc['default_effort_hours']:g} h)",
                          [choices[:3], choices[3:]] if len(choices) > 3 else choices)
+        elif exam:
+            hours = planner.exam_prep_hours(self.cfg, exam)
+            choices = [(f"{h:g} h", f"effort:{row['id']}:{h}") for h in slotpicker.EXAM_CHOICES] + [("No prep", f"effort:{row['id']}:0")]
+            self.tg.edit(row["tg_message_id"], text + f"\nHow much preparation? (default for a {exam}: {hours:g} h)",
+                         [choices[:3], choices[3:]])
         else:
             self.tg.edit(row["tg_message_id"], text)
         log.info("added %r", item["title"])
@@ -450,8 +478,11 @@ class Listener:
             tap.answer("Add it first")
             return
         self.state.set_effort(f"event:{event_id}", hours)
-        self.tg.edit(row["tg_message_id"], self._card(row) + f"\n\nAdded to your calendar and tasks\n"
-                     f"Work needed: {hours:g} h (send /plan to re-plan today with it)")
+        work = f"Preparation: {hours:g} h" if planner.exam_kind(row["item"]["title"]) and row["item"]["type"] != "deadline" \
+            else f"Work needed: {hours:g} h"
+        self.tg.edit(row["tg_message_id"], self._card(row) + "\n\nAdded to your calendar"
+                     + (" and tasks" if row["item"]["type"] == "deadline" else "")
+                     + (f"\n{work}" if hours else "\nNo preparation planned"))
         tap.answer(f"{hours:g} h")
         log.info("effort for %r set to %g h", row["item"]["title"], hours)
 

@@ -7,8 +7,11 @@
 
 Steps, once a day, starting the first time the laptop is on after planner.plan_after:
   1. Telegram asks "What do you want to get done today?"; replies become to-dos in Google Tasks (todos.py).
-  2. When you tap Done or Nothing today, or after morning.wait_minutes without an answer:
-     plan the rest of the day (planner.py), then send ONE message: today's plan + the digest.
+  2. When you tap Done or Nothing today, or after morning.wait_minutes without an answer: ONE message (today's
+     tasks + the digest), then one message per task with free slots to pick from (slotpicker.py). Nothing is
+     booked until you tap a time.
+Every tick also sends "Did you finish?" for booked slots that ended, one reminder for tasks still without a
+time, and the evening check (slotpicker.tick).
 The day only counts as done once Telegram has the message; if it couldn't be reached (no Wi-Fi yet after
 wake-up), the same message is retried at the next ticks. After morning.latest_checkin (default 18:00) there
 is no check-in: the laptop was off all day, so it goes straight to the (evening) plan.
@@ -27,6 +30,7 @@ import calwatch
 import digest
 import logsetup
 import planner
+import slotpicker
 import slots
 from config import load_config
 from notifiers import deliver
@@ -97,6 +101,14 @@ def _retry_telegram(cfg, state, today):
     return True
 
 
+def _services():
+    from googleapiclient.discovery import build
+
+    from auth import get_credentials
+    creds = get_credentials()
+    return build("calendar", "v3", credentials=creds), build("tasks", "v1", credentials=creds)
+
+
 def finish(cfg, state, now, note=None):
     """Plan + morning message. Marked as done only once the message is on Telegram, so a failure (no network
     yet after wake-up, Google hiccup) is retried at the next tick instead of losing the day."""
@@ -111,21 +123,20 @@ def finish(cfg, state, now, note=None):
         return
     state.set_meta(IN_PROGRESS, now.isoformat())
     try:
+        plan_title = f"Your tasks for {now:%a %d %b}"
         try:
-            plan_title, plan_text, _ = planner.plan_today(cfg, state, now, how="auto")
-        except planner.PlannerBusy:
-            log.info("a plan is being made right now (/plan); the morning message waits for the next tick")
-            return
+            cal, tasks_api = _services()
+            _, _, cap_left = slotpicker.prepare(cfg, state, now, cal, tasks_api, rank=True)
+            plan_lines = slotpicker.morning_lines(state, today, cap_left, cfg["planner"])
         except Exception as e:  # noqa: BLE001 - still send the rest of the morning message
             if alerts.is_offline_error(e) or isinstance(e, (alerts.RefreshError, alerts.AuthExpired)):
                 raise
-            log.exception("planning failed; sending the morning message without a plan")
+            log.exception("working out today's tasks failed; sending the morning message without them")
             alerts.alert("crash:planner", f"Planning the day failed: {type(e).__name__}: {e}. Details in logs/morning.log",
                          state)
-            plan_title = f"Plan for {now:%a %d %b}"
-            plan_text = f"Couldn't plan today ({type(e).__name__}). Send /plan to try again."
-        _, sections = digest.build_digest(cfg, now, skip_planner_blocks=True, state=state)
-        sections.insert(1, (plan_title.replace("Plan for", "Your plan for"), plan_text.splitlines()))
+            plan_lines = [f"Couldn't work out today's tasks ({type(e).__name__}). Tap 'Plan rest of today' to try again."]
+        _, sections = digest.build_digest(cfg, now, skip_planner_blocks=True, state=state, show_unplanned=False)
+        sections.insert(1, (plan_title, plan_lines))
         title = f"Good morning - {now:%a %d %b}"
         text = ((note + "\n\n") if note else "") + digest.render(title, sections)
         (LOG_DIR / "digest.md").write_text(digest.render(title, sections, markdown=True))
@@ -142,6 +153,7 @@ def finish(cfg, state, now, note=None):
             return
         state.set_meta(MORNING_SENT, today.isoformat())
         log.info("morning message sent via %s", ", ".join(sent))
+        followups(cfg, state, now)  # the per-task "when?" messages
     finally:
         state.set_meta(IN_PROGRESS, "")
 
@@ -199,8 +211,31 @@ def maybe_backup(state, now):
 
 
 def tick(cfg, state, now):
-    today = now.date()
     maybe_backup(state, now)
+    _morning(cfg, state, now)
+    followups(cfg, state, now)
+
+
+def followups(cfg, state, now):
+    """Time-picking messages still to send, "Did you finish?", one reminder, the evening check."""
+    try:
+        tg = Telegram.from_file()
+        if state.get_meta(MORNING_SENT) == now.date().isoformat() and any(
+                r["minutes"] > 0 and not r["tg_message_id"] for r in state.plan_items(now.date(), statuses=["open"])):
+            cal, tasks_api = _services()  # the morning message went out but the per-task messages didn't yet
+            work_free, _, _ = planner.work_context(cfg, state, now, cal, tasks_api)
+            slotpicker.send_waiting(cfg, state, now, tg, work_free)
+        slotpicker.tick(cfg, state, now, tg, _services)
+    except TelegramError as e:
+        log.warning("follow-ups: Telegram unreachable (%s); next tick", e)
+    except Exception as e:
+        if not alerts.is_offline_error(e):
+            raise
+        log.warning("follow-ups: offline (%s); next tick", type(e).__name__)
+
+
+def _morning(cfg, state, now):
+    today = now.date()
     plan_after = slots.at(today, cfg["planner"]["plan_after"], now.tzinfo)
     if now < plan_after:
         return

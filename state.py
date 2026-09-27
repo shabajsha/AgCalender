@@ -93,6 +93,34 @@ CREATE TABLE IF NOT EXISTS series_copies (
     missing      INTEGER DEFAULT 0,  -- scans in a row it wasn't found at the source
     PRIMARY KEY (row_id, instance_key)
 );
+CREATE TABLE IF NOT EXISTS plan_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_date     TEXT,
+    work_key      TEXT,           -- "event:<DUE or exam event id>" or "task:<task id>"
+    title         TEXT,
+    kind          TEXT,           -- deadline / exam / task
+    due           TEXT,
+    list_id       TEXT,           -- the task's Google Tasks list (to tick it off or move it)
+    minutes       INTEGER,        -- still to be given a time today
+    tg_message_id INTEGER,        -- its "when?" message
+    status        TEXT,           -- open / booked / skipped
+    reminded      INTEGER DEFAULT 0,
+    sent_at       TEXT,           -- when its "when?" message went out (the reminder counts from here)
+    created_at    TEXT,
+    UNIQUE (plan_date, work_key)
+);
+CREATE TABLE IF NOT EXISTS booked_blocks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id       INTEGER,
+    event_id      TEXT,           -- the block on the Planner calendar
+    work_key      TEXT,
+    title         TEXT,
+    start         TEXT,
+    end           TEXT,
+    status        TEXT,           -- booked / asked / done / partly / notdone / cleared
+    tg_message_id INTEGER,        -- the "Did you finish?" message
+    created_at    TEXT
+);
 CREATE TABLE IF NOT EXISTS sender_prefs (
     sender     TEXT PRIMARY KEY,
     pref       TEXT,             -- asked / blocked / keep
@@ -340,6 +368,9 @@ class State:
     def todo_batch(self, batch):
         return [dict(r) for r in self.db.execute("SELECT * FROM todos WHERE batch = ? AND status = 'active'", (batch,))]
 
+    def todo_task_ids(self):
+        return {r["task_id"] for r in self.db.execute("SELECT task_id FROM todos WHERE status = 'active'")}
+
     def mark_todos_undone(self, batch):
         self.db.execute("UPDATE todos SET status = 'undone' WHERE batch = ?", (batch,))
         self.db.commit()
@@ -427,6 +458,80 @@ class State:
     def series_copy_delete(self, row_id, instance_key):
         self.db.execute("DELETE FROM series_copies WHERE row_id = ? AND instance_key = ?", (row_id, instance_key))
         self.db.commit()
+
+    # --- today's tasks waiting for a time, and the slots you booked (slotpicker.py) ----------------
+
+    PLAN_ITEM_FIELDS = {"title", "due", "list_id", "minutes", "tg_message_id", "status", "reminded", "kind", "sent_at"}
+    BLOCK_FIELDS = {"status", "tg_message_id", "event_id"}
+
+    def plan_item_upsert(self, day, work_key, title, kind, due, list_id, minutes):
+        """Today's row for a task: created open, or its title/due/minutes refreshed. Returns the row."""
+        row = self.db.execute("SELECT * FROM plan_items WHERE plan_date = ? AND work_key = ?",
+                              (day.isoformat(), work_key)).fetchone()
+        if row is None:
+            self.db.execute("INSERT INTO plan_items (plan_date, work_key, title, kind, due, list_id, minutes, status, "
+                            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                            (day.isoformat(), work_key, title, kind, due, list_id, minutes, _now()))
+        else:
+            self.db.execute("UPDATE plan_items SET title = ?, due = ?, minutes = ? WHERE id = ?",
+                            (title, due, minutes, row["id"]))
+        self.db.commit()
+        return dict(self.db.execute("SELECT * FROM plan_items WHERE plan_date = ? AND work_key = ?",
+                                    (day.isoformat(), work_key)).fetchone())
+
+    def plan_item(self, item_id):
+        row = self.db.execute("SELECT * FROM plan_items WHERE id = ?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def plan_items(self, day, statuses=None):
+        sql, args = "SELECT * FROM plan_items WHERE plan_date = ?", [day.isoformat()]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += list(statuses)
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY due, id", args)]
+
+    def plan_item_set(self, item_id, **fields):
+        bad = set(fields) - self.PLAN_ITEM_FIELDS
+        if bad:
+            raise ValueError(f"unknown plan_items fields: {bad}")
+        self.db.execute(f"UPDATE plan_items SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                        (*fields.values(), item_id))
+        self.db.commit()
+
+    def block_add(self, item_id, event_id, work_key, title, start, end):
+        cur = self.db.execute("INSERT INTO booked_blocks (item_id, event_id, work_key, title, start, end, status, created_at) "
+                              "VALUES (?, ?, ?, ?, ?, ?, 'booked', ?)",
+                              (item_id, event_id, work_key, title, start.isoformat(), end.isoformat(), _now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def block(self, block_id):
+        row = self.db.execute("SELECT * FROM booked_blocks WHERE id = ?", (block_id,)).fetchone()
+        return dict(row) if row else None
+
+    def blocks(self, statuses=None, item_id=None, work_key=None):
+        sql, args = "SELECT * FROM booked_blocks WHERE 1=1", []
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += list(statuses)
+        if item_id is not None:
+            sql, args = sql + " AND item_id = ?", args + [item_id]
+        if work_key is not None:
+            sql, args = sql + " AND work_key = ?", args + [work_key]
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY start", args)]
+
+    def block_set(self, block_id, **fields):
+        bad = set(fields) - self.BLOCK_FIELDS
+        if bad:
+            raise ValueError(f"unknown booked_blocks fields: {bad}")
+        self.db.execute(f"UPDATE booked_blocks SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                        (*fields.values(), block_id))
+        self.db.commit()
+
+    def block_answers(self):
+        """{planner event id: done / partly / notdone} for blocks you've answered "Did you finish?" about."""
+        return {r["event_id"]: r["status"] for r in self.db.execute(
+            "SELECT event_id, status FROM booked_blocks WHERE status IN ('done', 'partly', 'notdone')")}
 
     def watch_statuses(self):
         """{(cal_id, event_key): status} for everything the watcher knows about."""

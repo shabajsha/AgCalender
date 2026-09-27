@@ -25,7 +25,8 @@ They are listed in `.gitignore`.
 | `telegram_setup.py` | One-time: asks for your bot token (hidden), finds your chat, writes `telegram.json`. |
 | `morning.py` | Morning routine: check-in question on Telegram, then plan + one combined morning message. `--tick` (timer), `--finish`, `--start` (test). |
 | `todos.py` | Parses to-dos you send ("Lab report 2h") and adds/undoes them in DAILY TASKS, due today. |
-| `planner.py` | Plans the rest of today: habits first, then work blocks for deadlines and dated tasks. `--auto` (timer), `--print`, `--clear [--date]`. |
+| `planner.py` | Works out today's work (deadlines, exam prep, to-dos, dated tasks) and your free time. Default: send free slots to pick from (`--suggest-new` for a new to-do only); `--print` previews an automatic plan; `--place` / `--auto` place blocks without asking (old behaviour); `--clear [--date]`. |
+| `slotpicker.py` | You choose when: one Telegram message per task with free slots as buttons, booking, "Did you finish?" after each slot, one reminder, the evening check, `/exams`. |
 | `slots.py` | Free-time arithmetic (subtract busy time, sleep, gaps; place blocks). Pure Python, no LLM. |
 | `ranker.py` | Asks the model only to *order* the open work; falls back to earliest-due-first. |
 | `llm.py` | The single guarded Ollama call (RAM check, GPU check, timeout) used by `extractor.py` and `ranker.py`. |
@@ -189,7 +190,8 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | `/calendars` | Lists your calendars; tap one to cycle ask / copy / show / ignore. |
 | `/review` | The calendar review right now: what's new, changed or cancelled on your calendars. |
 | `/check`, **Check mail now** | Runs a mail check immediately instead of waiting for the next 30-minute run. |
-| `/plan`, **Plan rest of today** | Re-plans from now: habits, then work blocks (replaces today's not-yet-started blocks). |
+| `/plan`, **Plan rest of today** | Sends each task that still needs time today, with free slots to pick from. Nothing is booked until you tap a time. |
+| `/exams` | Exams in the next 2 weeks and how much preparation each gets; tap to change (or none). |
 | `/clear` | Removes today's planner-made blocks that haven't started (also the **Clear today's plan** button). Blocks already worked stay: later plans count them as done. |
 | `/pause` | Stops reading mail. Your other calendars are still checked, buttons on existing cards still work, and the digest still arrives, noting the pause. |
 | `/skipped` | Emails the pre-filter skipped (no deadline words), newest first, with **Read** buttons to run the model on one anyway. |
@@ -235,14 +237,41 @@ systemctl --user daemon-reload
 systemctl --user enable --now calendar-planner.timer
 ```
 
+## You choose when (slot picking)
+
+After the check-in (or on **Plan rest of today**) each task that needs time today gets its own message:
+
+```
+Study SDET MidSem
+2 h to do today (due Sun 27 Sep 23:59). Pick a time for the first 1 h 30 min:
+[11:00-12:30] [14:00-15:30] [19:00-20:30]
+[More times] [Not today]
+```
+
+- The slots are real free time (all your calendars, gaps, sleep), spread over morning / afternoon / evening, and
+  never after the task is due. Tapping one books it on the Planner calendar; the other messages update so that time
+  isn't offered twice. **Nothing is booked until you tap.** *Not today* moves a to-do to tomorrow.
+- A task you haven't given a time gets **one reminder** `morning.remind_after_minutes` (2 h) later, with fresh slots.
+- When a booked slot ends: **"Did you finish ...?" Done / Partly / Not done.** Done ticks the to-do off in Google Tasks
+  once its time is all done; Partly or Not done offers new slots. Your answers count (done 100%, partly 50%, not
+  done 0), so work that didn't happen is planned again. No questions during the sleep window; they come after it.
+- At `morning.evening_check` (21:30): the day's summary (done, not done, not answered, no time picked) with
+  **Move to tomorrow** for unfinished to-dos.
+- **Exams** (midsem, endsem, quiz, exam, test, viva on the College calendar, from email, the timetable or Moodle) get
+  preparation time before them: `planner.exam_prep_hours` (quiz 2 h, midsem 8 h, endsem 12 h, other 6 h), spread over
+  the days left. Change one with `/exams` or the buttons on its card. The morning message lists exams coming up.
+- `/todo` after the morning sends free slots for the new to-do straight away.
+- The daily limit (`max_work_hours_per_day`) is a warning, never a silent drop.
+
 ## Morning check-in
 
 The first time the laptop is on after `planner.plan_after` (06:45), the bot asks **"What do you want to get done
 today?"**. Reply one to-do per line, optionally with a time (`Lab report 2h`, `Call bank 15m`, `Revise OS 1h30m`;
 no time = `todo_default_minutes`). Each reply is added to **DAILY TASKS** due today, with its time stored as effort,
 and confirmed with **Undo**. Tap **Done** (or **Nothing today**). After `morning.wait_minutes` (45) without an
-answer it goes ahead anyway. Then the day is planned and **one morning message** arrives: today's events, your plan,
-deadlines, and tasks. This replaces the separate 07:00 digest.
+answer it goes ahead anyway. Then **one morning message** arrives (today's events, your tasks for today, exams,
+deadlines and tasks due), followed by one message per task with free slots to pick from (see above). This replaces
+the separate 07:00 digest.
 
 - Plain messages count as to-dos only while the check-in is open; at any other time use `/todo`. Typing
   "done" or "nothing" works like the buttons. The buttons are dated, so an old one never starts a new day.

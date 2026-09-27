@@ -16,6 +16,7 @@ import calwatch
 import google_writer
 import gtasks
 import logsetup
+import planner
 import alerts
 from config import load_config
 from google_writer import DUE_PREFIX, PLANNER_TAG
@@ -55,9 +56,9 @@ def _due_datetime(event, tz):
     return datetime.combine(start, time(23, 59), tz) if all_day else end
 
 
-def build_digest(cfg, now, skip_planner_blocks=False, state=None):
+def build_digest(cfg, now, skip_planner_blocks=False, state=None, show_unplanned=True):
     """(title, sections). skip_planner_blocks leaves the planner's own blocks out of "Today" (morning.py lists
-    the plan separately)."""
+    the plan separately); show_unplanned=False drops "No work time planned yet" (the morning asks for times)."""
     state = state or State()
     tz = now.tzinfo
     days = cfg.get("digest", {}).get("days_ahead", 7)
@@ -89,8 +90,16 @@ def build_digest(cfg, now, skip_planner_blocks=False, state=None):
     today_lines = [line for _, line in sorted(today_lines)] or ["- Nothing scheduled"]
 
     # Deadlines the agent created (DUE: events end at the due time), and work blocks on the planner
-    deadlines = [ev for ev in fetch_events(cal, calendars["college"], now, horizon)
-                 if ev.get("summary", "").startswith(DUE_PREFIX)]
+    college = fetch_events(cal, calendars["college"], now, horizon)
+    deadlines = [ev for ev in college if ev.get("summary", "").startswith(DUE_PREFIX)]
+    exam_lines = []
+    for ev in college:
+        kind = planner.exam_kind(ev.get("summary", "")) if not ev.get("summary", "").startswith(DUE_PREFIX) else None
+        start, _, all_day = _event_times(ev, tz)
+        if kind and (all_day or start > now):
+            hours = planner._effort(state, f"event:{ev['id']}", planner.exam_prep_hours(cfg, kind))
+            stamp = f"{start:%a %d %b}" if all_day else f"{start:%a %d %b %H:%M}"
+            exam_lines.append(f"- {stamp}  {ev['summary']} ({kind}; " + (f"{hours:g} h prep" if hours else "no prep") + ")")
     blocks = google_writer.list_blocks(cal, calendars["planner"], now - timedelta(days=60), horizon) if deadlines else []
     blocks = [b for b in blocks if not _event_times(b, tz)[2]]
     finished = gtasks.completed_ids(tasks, cfg["tasklist"]) if deadlines and cfg.get("tasklist") else set()
@@ -133,9 +142,11 @@ def build_digest(cfg, now, skip_planner_blocks=False, state=None):
     paused = state.paused_since()
     if paused:
         sections.append(("Mail reading is paused", [f"- since {paused.astimezone(tz):%a %d %b %H:%M}. Send /resume in Telegram to continue."]))
-    sections += [("Today", today_lines),
-                (f"Deadlines in the next {days} days", due_lines or ["- None"])]
-    if unplanned:
+    sections += [("Today", today_lines)]
+    if exam_lines:
+        sections.append((f"Exams in the next {days} days (/exams to change prep)", exam_lines))
+    sections.append((f"Deadlines in the next {days} days", due_lines or ["- None"]))
+    if unplanned and show_unplanned:
         sections.append(("No work time planned yet", unplanned))
     if task_lines:
         sections.append(("Your tasks due soon", task_lines))

@@ -119,6 +119,8 @@ morning:
   checkin: true                # ask for today's to-dos before planning and the morning message
   wait_minutes: 45             # go ahead without an answer after this long
   latest_checkin: "18:00"      # laptop first on after this: no "good morning" question, just plan what's left
+  remind_after_minutes: 120    # a task still without a time gets one reminder (with fresh free slots) this much later
+  evening_check: "21:30"       # summary of the day: done / not done / no time picked, "Move to tomorrow"
   todo_tasklist: 'MDY3MjgzMjQwODkyOTI3NTU4MzQ6MDow'   # "DAILY TASKS"
   todo_default_minutes: 30     # for to-dos sent without a time
 
@@ -133,6 +135,11 @@ planner:
   max_work_hours_per_day: 6
   default_effort_hours: 3      # per deadline, unless you pick another on its Telegram card
   effort_choices_hours: [2, 4, 8, 12, 20, 30]
+  exam_prep_hours:             # preparation planned before an exam on College (change per exam with /exams)
+    quiz: 2
+    midsem: 8
+    endsem: 12
+    exam: 6                    # "exam", "test", "viva" and anything else
   task_effort_hours: 1         # your own Google Tasks that have a due date
   horizon_days: 14             # only deadlines within this many days are planned
   carry_over_days: 3           # your tasks overdue by up to this many days are planned today

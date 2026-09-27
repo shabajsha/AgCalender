@@ -16,7 +16,7 @@ def T(h, m=0, d=0):
 
 @pytest.fixture
 def calls(monkeypatch, tmp_path):
-    log = {"checkins": [], "plans": [], "sent": [], "deliver_ok": True, "checkin_error": False}
+    log = {"checkins": [], "plans": [], "sent": [], "deliver_ok": True, "checkin_error": False, "followups": []}
 
     def send_checkin(cfg, state, now, late):
         if log["checkin_error"]:
@@ -25,10 +25,13 @@ def calls(monkeypatch, tmp_path):
         state.set_meta(morning.CHECKIN_SENT, now.isoformat())
 
     monkeypatch.setattr(morning, "send_checkin", send_checkin)
-    monkeypatch.setattr(morning.planner, "plan_today",
-                        lambda cfg, st, now, how: log["plans"].append(now) or ("Plan for x", "Work\n- 09:00  DSA", 1))
+    monkeypatch.setattr(morning, "_services", lambda: (None, None))
+    monkeypatch.setattr(morning.slotpicker, "prepare",
+                        lambda cfg, st, now, cal, tasks, rank=True: log["plans"].append(now) or ([], [], 360))
+    monkeypatch.setattr(morning.slotpicker, "morning_lines", lambda st, today, cap, pc: ["- DSA: 1 h"])
+    monkeypatch.setattr(morning, "followups", lambda cfg, st, now: log["followups"].append(now))
     monkeypatch.setattr(morning.digest, "build_digest",
-                        lambda cfg, now, skip_planner_blocks, state=None: ("t", [("Today", ["- class"]), ("Deadlines", ["- None"])]))
+                        lambda cfg, now, skip_planner_blocks, state=None, show_unplanned=True: ("t", [("Today", ["- class"]), ("Deadlines", ["- None"])]))
     monkeypatch.setattr(morning.alerts, "alert", lambda key, text, state=None: log.setdefault("alerts", []).append(key))
     monkeypatch.setattr(morning, "deliver",
                         lambda title, text, ch, buttons=None: (log["sent"].append(text) or ch) if log["deliver_ok"] else
@@ -84,7 +87,7 @@ def test_offline_while_planning_retries_at_the_next_tick(calls, db, monkeypatch)
     from google.auth.exceptions import TransportError
     db.set_meta(morning.CHECKIN_SENT, T(6, 45).isoformat())
     db.set_meta(morning.CHECKIN_ANSWERED, T(6).date().isoformat())
-    monkeypatch.setattr(morning.planner, "plan_today", lambda *a, **k: (_ for _ in ()).throw(TransportError("no DNS")))
+    monkeypatch.setattr(morning.slotpicker, "prepare", lambda *a, **k: (_ for _ in ()).throw(TransportError("no DNS")))
     with pytest.raises(TransportError):
         morning.tick(CFG, db, T(7))
     assert db.get_meta(morning.MORNING_SENT) in (None, "")       # next tick will try again
@@ -94,9 +97,9 @@ def test_offline_while_planning_retries_at_the_next_tick(calls, db, monkeypatch)
 def test_a_planner_bug_still_sends_the_morning_message(calls, db, monkeypatch):
     db.set_meta(morning.CHECKIN_SENT, T(6, 45).isoformat())
     db.set_meta(morning.CHECKIN_ANSWERED, T(6).date().isoformat())
-    monkeypatch.setattr(morning.planner, "plan_today", lambda *a, **k: (_ for _ in ()).throw(KeyError("window")))
+    monkeypatch.setattr(morning.slotpicker, "prepare", lambda *a, **k: (_ for _ in ()).throw(KeyError("window")))
     morning.tick(CFG, db, T(7))
-    assert "Couldn't plan today (KeyError)" in calls["sent"][0] and "- class" in calls["sent"][0]
+    assert "Couldn't work out today's tasks (KeyError)" in calls["sent"][0] and "- class" in calls["sent"][0]
     assert db.get_meta(morning.MORNING_SENT) == T(6).date().isoformat() and calls["alerts"] == ["crash:planner"]
 
 
