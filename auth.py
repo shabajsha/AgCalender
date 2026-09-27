@@ -69,6 +69,19 @@ def get_credentials(interactive=None):
     return creds
 
 
+def new_login():
+    """A fresh browser login even if the saved one still works (e.g. after publishing the app, so the new token
+    doesn't expire after 7 days). The old token.json is only replaced once the new login succeeded."""
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+    creds = flow.run_local_server(port=0, timeout_seconds=LOGIN_TIMEOUT_S)
+    _save(creds)
+    return creds
+
+
 if __name__ == "__main__":
-    get_credentials(interactive=True)
-    print("Authenticated OK; token saved to token.json")
+    if "--new" in sys.argv[1:]:
+        new_login()
+        print("New login saved to token.json. Now run: systemctl --user restart calendar-approvals calendar-web")
+    else:
+        get_credentials(interactive=True)
+        print("Authenticated OK; token saved to token.json")
