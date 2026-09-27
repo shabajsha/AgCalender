@@ -32,6 +32,7 @@ import habits
 import llm
 import logsetup
 import morning
+import nlcommands
 import planner
 import settings
 import slotpicker
@@ -66,7 +67,7 @@ LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
 SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo", "mv", "cx",
-                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp"}
+                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp", "nl"}
 DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
 SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
 HABIT_ACTIONS = ("hbn", "hbm", "hbd", "hbw", "hbs", "hbx", "hbp", "hbr", "hby", "hbl")
@@ -178,6 +179,9 @@ class Listener:
         now = datetime.now(self._tz())
         if action in SLOT_ACTIONS:
             slotpicker.handle(self, cq, action, rest, now)
+            return
+        if action == "nl":  # the confirmation of a plan change you typed
+            nlcommands.handle(self, cq, rest, now)
             return
         if action in DEADLINE_ACTIONS:
             deadlines.handle(self, cq, action, rest, now)
@@ -325,8 +329,11 @@ class Listener:
             log.info("resumed via Telegram")
         elif command == "/status":
             self.tg.send(*self.status_card())
+        elif text and not text.startswith("/") and nlcommands.handle_text(self, text, now):
+            pass  # a plan change you typed: a confirmation went out
         else:  # /start, /help or anything else: show what's possible, with the button bar
-            self.tg.send("Commands (or use the buttons below):\n" + "\n".join(f"/{c} - {d}" for c, d in COMMANDS),
+            self.tg.send('Change plans by typing, e.g. "move SDET study to 7pm", "leetcode not today", "busy 2-5pm".\n\n'
+                         + "Commands (or use the buttons below):\n" + "\n".join(f"/{c} - {d}" for c, d in COMMANDS),
                          keyboard=KEYBOARD)
 
     def status_card(self):

@@ -84,7 +84,7 @@ def test_todo_command_and_undo(bot, tg):
 
 def test_plain_text_is_a_todo_only_during_checkin(bot, tg, db):
     say(bot, "Buy milk")
-    assert tg.sent[-1]["text"].startswith("Commands")
+    assert "Commands (or use the buttons below)" in tg.sent[-1]["text"]
     db.set_meta(morning.CHECKIN_SENT, datetime.now(TZ).isoformat())
     say(bot, "Finish lab report 2h\nCall bank 15m")
     today = datetime.now(TZ).date().isoformat()
@@ -92,7 +92,7 @@ def test_plain_text_is_a_todo_only_during_checkin(bot, tg, db):
     tap(bot, f"checkin:done:{today}")
     assert bot.runs[-1] == ("morning.py", ("--finish",), "calendar-morning-now")
     say(bot, "Gym 1h")
-    assert tg.sent[-1]["text"].startswith("Commands")        # check-in closed
+    assert "Commands (or use the buttons below)" in tg.sent[-1]["text"]        # check-in closed
 
 
 def test_commands(bot, tg, db):
