@@ -56,6 +56,29 @@ def _due_datetime(event, tz):
     return datetime.combine(start, time(23, 59), tz) if all_day else end
 
 
+def events_today(cfg, cal, state, now, skip_planner_blocks=True):
+    """Today's events across every calendar you have switched on. Tracked events appear through their College copy;
+    events still waiting for Track/Ignore are marked; ignored ones and ignored calendars are left out."""
+    tz = now.tzinfo
+    day_start = datetime.combine(now.date(), time(), tz)
+    lines, statuses = [], state.watch_statuses()
+    for c in calwatch.load_calendars(cal, cfg, state):
+        if not c["selected"] or c["policy"] == "ignore":
+            continue
+        for ev in fetch_events(cal, c["id"], day_start, day_start + timedelta(days=1)):
+            if skip_planner_blocks and ev.get("extendedProperties", {}).get("private", {}).get("source") == PLANNER_TAG:
+                continue
+            status = statuses.get((c["id"], calwatch.event_key(ev)))
+            if not calwatch.shown_today(c["policy"], status):
+                continue
+            start, end, all_day = _event_times(ev, tz)
+            when = "all day" if all_day else f"{start:%H:%M}-{end:%H:%M}"
+            sort_key = "" if all_day else f"{start:%H:%M}"
+            undecided = "  - not decided yet" if c["policy"] in ("ask", "copy") else ""
+            lines.append((sort_key, f"- {when}  {ev.get('summary', '(no title)')}  ({c['label']}){undecided}"))
+    return [line for _, line in sorted(lines)] or ["- Nothing scheduled"]
+
+
 def build_digest(cfg, now, skip_planner_blocks=False, state=None, show_unplanned=True):
     """(title, sections). skip_planner_blocks leaves the planner's own blocks out of "Today" (morning.py lists
     the plan separately); show_unplanned=False drops "No work time planned yet" (the morning asks for times)."""
@@ -70,24 +93,7 @@ def build_digest(cfg, now, skip_planner_blocks=False, state=None, show_unplanned
     tasks = build("tasks", "v1", credentials=creds)
     calendars = {"primary": "primary", **{k: v for k, v in cfg["calendars"].items()}}
 
-    # Today, across every calendar you have switched on. Tracked events appear through their College copy;
-    # events still waiting for Track/Ignore are marked; ignored ones and ignored calendars are left out.
-    today_lines, statuses = [], state.watch_statuses()
-    for c in calwatch.load_calendars(cal, cfg, state):
-        if not c["selected"] or c["policy"] == "ignore":
-            continue
-        for ev in fetch_events(cal, c["id"], day_start, day_start + timedelta(days=1)):
-            if skip_planner_blocks and ev.get("extendedProperties", {}).get("private", {}).get("source") == PLANNER_TAG:
-                continue
-            status = statuses.get((c["id"], calwatch.event_key(ev)))
-            if not calwatch.shown_today(c["policy"], status):
-                continue
-            start, end, all_day = _event_times(ev, tz)
-            when = "all day" if all_day else f"{start:%H:%M}-{end:%H:%M}"
-            sort_key = "" if all_day else f"{start:%H:%M}"
-            undecided = "  - not decided yet" if c["policy"] in ("ask", "copy") else ""
-            today_lines.append((sort_key, f"- {when}  {ev.get('summary', '(no title)')}  ({c['label']}){undecided}"))
-    today_lines = [line for _, line in sorted(today_lines)] or ["- Nothing scheduled"]
+    today_lines = events_today(cfg, cal, state, now, skip_planner_blocks)
 
     # Deadlines the agent created (DUE: events end at the due time), and work blocks on the planner
     college = fetch_events(cal, calendars["college"], now, horizon)

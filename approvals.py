@@ -25,11 +25,14 @@ from googleapiclient.discovery import build
 
 import alerts
 import calwatch
+import deadlines
 import google_writer
+import habits
 import llm
 import logsetup
 import morning
 import planner
+import settings
 import slotpicker
 import todos
 from auth import AuthExpired, get_credentials
@@ -40,7 +43,10 @@ from telegram_bot import Telegram, TelegramError
 
 LOG_DIR = Path(__file__).parent / "logs"
 EXPIRE_EVERY_S = 600
-COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
+COMMANDS = [("today", "Today at a glance: events, your blocks, tasks without a time"),
+            ("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
+            ("deadlines", "Upcoming deadlines: done, effort, move the date, not doing"),
+            ("habits", "Your habits and streaks; add a new one"),
             ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
             ("skipped", "Emails I skipped (no deadline words), with a button to read one anyway"),
             ("exams", "Exams coming up and how much preparation each gets"),
@@ -50,16 +56,23 @@ COMMANDS = [("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
             ("clear", "Remove today's planned blocks that haven't started"),
             ("pause", "Stop reading mail until /resume (calendar checks continue)"),
             ("resume", "Start reading mail again (checks right away)"),
+            ("settings", "Change work hours, daily limit, morning time, reminders..."),
             ("status", "Is everything working? Last checks, login, GPU, waiting cards")]
 # Permanent button bar at the bottom of the chat; each label maps to a command.
-KEYBOARD = [["Check mail now", "Plan rest of today"], ["Status", "Pause", "Resume"]]
-LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "/status",
-          "pause": "/pause", "resume": "/resume"}
+KEYBOARD = [["Check mail now", "Plan rest of today"], ["Today", "Deadlines", "Habits"], ["Settings", "Status"]]
+LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "/status", "today": "/today",
+          "deadlines": "/deadlines", "habits": "/habits", "settings": "/settings", "pause": "/pause", "resume": "/resume"}
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
-SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo",
-                "sgb", "sgm", "sgn", "bkd", "eve", "prep"}
-SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep")  # slotpicker.py: times, "Did you finish?", evening, exams
+SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo",
+                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp"}
+DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
+SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
+HABIT_ACTIONS = ("hbn", "hbm", "hbd", "hbw", "hbs", "hbx", "hbp", "hbr", "hby", "hbl")
+UNDO_ADD_WINDOW = timedelta(minutes=10)
+# slotpicker.py: times, "Did you finish?", evening check, exams, heads-up, moving a block
+SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb")
+HEADS_UP_EVERY_S = 60
 # Typed instead of tapping the check-in buttons (a whole message, after lowercasing and trimming punctuation).
 DONE_WORDS = {"done", "finished", "that's all", "thats all", "that's it", "thats it", "all done", "ok", "okay"}
 NONE_WORDS = {"nothing", "nothing today", "no", "none", "nope", "no tasks", "nil"}
@@ -161,8 +174,32 @@ class Listener:
         if action in ("crv", "crva"):  # the daily calendar review and "changed" cards
             calwatch.handle_review(self, cq, action, rest, datetime.now(self._tz()))
             return
+        now = datetime.now(self._tz())
         if action in SLOT_ACTIONS:
-            slotpicker.handle(self, cq, action, rest, datetime.now(self._tz()))
+            slotpicker.handle(self, cq, action, rest, now)
+            return
+        if action in DEADLINE_ACTIONS:
+            deadlines.handle(self, cq, action, rest, now)
+            return
+        if action == "dlb":
+            deadlines.back(self, cq, now)
+            return
+        if action in SETTING_ACTIONS:
+            settings.handle(self, cq, action, rest, now)
+            return
+        if action in HABIT_ACTIONS:
+            habits.handle(self, cq, action, rest, now)
+            return
+        if action == "tdp":  # "Plan rest of today" under /today
+            started = self._run_planner()
+            self.tg.edit(cq["message"]["message_id"], "Finding free slots for the rest of today; they follow below."
+                         if started is True else "Already on it." if started == "busy" else "Couldn't start the planner.")
+            return
+        if action == "st":  # Pause / Resume under /status
+            self.handle_message({"chat": {"id": self.tg.chat_id}, "text": "/pause" if rest == "p" else "/resume",
+                                 "date": time.time()})
+            self.tg.edit(cq["message"]["message_id"], *self.status_card())
+            tap.answer("Paused" if rest == "p" else "Resumed")
             return
         if action in ("cal", "calb", "cale", "calc", "calu", "calp"):  # events from your other calendars
             calwatch.handle_callback(self, cq, action, rest, datetime.now(self._tz()))
@@ -191,7 +228,8 @@ class Listener:
         if action == "effort":  # "effort:<pending id>:<hours>"
             self.effort(row, cq, tap, arg)
             return
-        handler = {"add": self.add, "skip": self.skip, "block": self.block, "keep": self.keep}.get(action)
+        handler = {"add": self.add, "skip": self.skip, "block": self.block, "keep": self.keep,
+                   "addundo": self.undo_add}.get(action)
         if handler is None:
             tap.answer("Unknown button")
             return
@@ -208,9 +246,15 @@ class Listener:
         if time.time() - sent_at > OFFLINE_AFTER_S and command in ("/check", "/plan", "/clear", "/todo"):
             stamp = datetime.fromtimestamp(sent_at, self._tz())
             self.tg.send(f"Got your {command} from {stamp:%a %H:%M}. The laptop was off or asleep then; doing it now.")
-        today = datetime.now(self._tz()).date()
+        now = datetime.now(self._tz())
+        today = now.date()
         typed = re.sub(r"[^\w' ]+", "", text.lower()).strip()
         checkin_open = morning.checkin_open(self.state, today)
+        conv = self.state.conv(now) if text and not text.startswith("/") and not LABELS.get(text.lower()) else None
+        if conv:  # a value you were asked to type (a setting, a habit, a new due date)
+            {"setting": settings.typed, "habit": habits.typed, "deadline_date": deadlines.typed}.get(
+                conv["flow"], lambda *a: self.state.clear_conv())(self, conv, text, now)
+            return
         if command == "/todo":
             body = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
             if body:
@@ -224,6 +268,14 @@ class Listener:
             self.add_todos(text, today)
         elif command == "/skipped":
             self.show_skipped()
+        elif command == "/today":
+            self.tg.send(*slotpicker.today_message(self.cfg, self.state, self.calendar, now))
+        elif command == "/deadlines":
+            self.tg.send(*deadlines.list_message(self.cfg, self.state, self.calendar, now))
+        elif command == "/habits":
+            self.tg.send(*habits.list_message(self.cfg, self.state, today))
+        elif command == "/settings":
+            self.tg.send(*settings.menu(self.cfg))
         elif command == "/exams":
             self.tg.send(*slotpicker.exams_message(self.cfg, self.state, datetime.now(self._tz()), self.calendar))
         elif command == "/review":
@@ -269,10 +321,14 @@ class Listener:
                          "Resumed. The next mail check is within 30 minutes.")
             log.info("resumed via Telegram")
         elif command == "/status":
-            self.tg.send(self.status_text())
+            self.tg.send(*self.status_card())
         else:  # /start, /help or anything else: show what's possible, with the button bar
             self.tg.send("Commands (or use the buttons below):\n" + "\n".join(f"/{c} - {d}" for c, d in COMMANDS),
                          keyboard=KEYBOARD)
+
+    def status_card(self):
+        paused = self.state.paused_since()
+        return self.status_text(), [[("Resume mail reading", "st:r") if paused else ("Pause mail reading", "st:p")]]
 
     def status_text(self):
         tz, state = self._tz(), self.state
@@ -452,20 +508,44 @@ class Listener:
                                str(_when(item)), row["msg_id"])
         self.state.set_pending_status(row["id"], "added")
         text = self._card(row) + "\n\nAdded to your calendar" + (" and tasks" if task_id else "")
+        undo = [("Undo (10 min)", f"addundo:{row['id']}")]
         exam = item["type"] != "deadline" and planner.exam_kind(item["title"])
         if item["type"] == "deadline":
             pc = self.cfg["planner"]
             choices = [(f"{h:g} h", f"effort:{row['id']}:{h}") for h in pc["effort_choices_hours"]]
             self.tg.edit(row["tg_message_id"], text + f"\nHow much work does it need? (default {pc['default_effort_hours']:g} h)",
-                         [choices[:3], choices[3:]] if len(choices) > 3 else choices)
+                         [choices[:3], choices[3:], undo] if len(choices) > 3 else [choices, undo])
         elif exam:
             hours = planner.exam_prep_hours(self.cfg, exam)
             choices = [(f"{h:g} h", f"effort:{row['id']}:{h}") for h in slotpicker.EXAM_CHOICES] + [("No prep", f"effort:{row['id']}:0")]
             self.tg.edit(row["tg_message_id"], text + f"\nHow much preparation? (default for a {exam}: {hours:g} h)",
-                         [choices[:3], choices[3:]])
+                         [choices[:3], choices[3:], undo])
         else:
-            self.tg.edit(row["tg_message_id"], text)
+            self.tg.edit(row["tg_message_id"], text, [undo])
         log.info("added %r", item["title"])
+
+    def undo_add(self, row, cq, tap):
+        """Undo an Add within UNDO_ADD_WINDOW: the event (and task) go, and the card asks again."""
+        decided = datetime.fromisoformat(row["decided_at"]) if row["decided_at"] else None
+        if row["status"] != "added" or decided is None or datetime.now(decided.tzinfo) - decided > UNDO_ADD_WINDOW:
+            self.tg.edit(row["tg_message_id"], self._card(row) + "\n\nAdded to your calendar. (Too late to undo here: "
+                         "use /deadlines -> Not doing, or delete the event.)")
+            return
+        event_id = self.state.event_id_for(row["dedupe_key"])
+        task_id = self.state.task_for_event(event_id) if event_id else None
+        if event_id:
+            google_writer.delete_event(self.calendar, self.cfg["calendars"]["college"], event_id)
+            self.state.delete_item_by_event(event_id)
+        if task_id:
+            try:
+                self.tasks.tasks().delete(tasklist=self.cfg.get("tasklist", "@default"), task=task_id).execute()
+            except Exception as e:  # noqa: BLE001 - already gone is fine
+                if getattr(getattr(e, "resp", None), "status", None) not in (404, 410):
+                    raise
+        self.state.set_pending_status(row["id"], "pending")
+        self.tg.edit(row["tg_message_id"], self._card(row) + "\n\nUndone: removed again.",
+                     [("Add", f"add:{row['id']}"), ("Skip", f"skip:{row['id']}")])
+        log.info("undid add of %r", row["item"]["title"])
 
     def effort(self, row, cq, tap, arg):
         try:
@@ -547,7 +627,7 @@ def main():
     except TelegramError as e:
         log.warning("could not register bot commands: %s", e)
     log.info("listening for taps and commands: %s (Ctrl+C to stop)", " ".join("/" + c for c, _ in COMMANDS))
-    offset, last_expire, offline_since = None, 0.0, None
+    offset, last_expire, offline_since, last_heads_up = None, 0.0, None, 0.0
     while True:
         try:
             updates = listener.tg.updates(offset)
@@ -576,6 +656,12 @@ def main():
             except Exception as e:
                 log.exception("failed to handle an update")
                 listener.report_error(e)
+        if time.time() - last_heads_up > HEADS_UP_EVERY_S:
+            try:
+                slotpicker.heads_up(listener, datetime.now(listener._tz()))
+            except Exception:
+                log.exception("heads-up check failed")
+            last_heads_up = time.time()
         if time.time() - last_expire > EXPIRE_EVERY_S:
             try:
                 listener.expire_old()

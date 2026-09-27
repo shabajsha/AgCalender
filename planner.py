@@ -201,10 +201,11 @@ def _plan_today(cfg, state, now, dry_run, how):
     free = free_today(cal, cfg, state, now, removed)
 
     # 3. Habits first, inside their own windows.
+    import habits
     done_habits = {b.get("summary") for b in kept[cals["habits"]]}
     habit_blocks, missed_habits = [], []
-    for h in cfg.get("habits") or []:
-        if DAY_NAMES[today.weekday()] not in [d.lower()[:3] for d in h.get("days", DAY_NAMES)] or h["name"] in done_habits:
+    for h in habits.for_day(cfg, state, today):
+        if h["name"] in done_habits:
             continue
         window = (slots.at(today, h["window"][0], tz), slots.at(today, h["window"][1], tz))
         block, free = slots.place_one(free, h["minutes"], gap, window=window)
@@ -305,19 +306,21 @@ def needed_today(cal, tasks_api, cfg, state, now, done_by_key):
 
 
 def work_context(cfg, state, now, cal, tasks_api, rank=False):
-    """What the slot suggestions need: (work_free, items, cap_left). work_free = free time inside the work
-    window (booked blocks already taken out); each item's `need` = today's share minus what's already booked today."""
-    pc, today, tz = cfg["planner"], now.date(), now.tzinfo
+    """What the slot suggestions need: (free, items, cap_left). free = today's free time from now (busy time, gaps,
+    sleep and booked blocks taken out; each item is then limited to its own window: work hours, or a habit's window).
+    Each item's `need` = today's share minus what's already booked today. Habits come first."""
+    import habits
+    pc, today = cfg["planner"], now.date()
     done, booked, worked, booked_total = block_minutes(cal, cfg, state, now)
     free = free_today(cal, cfg, state, now)
-    work_free = slots.intersect(free, (slots.at(today, pc["work_window"][0], tz), slots.at(today, pc["work_window"][1], tz)))
     items = needed_today(cal, tasks_api, cfg, state, now, done)
     for it in items:
         it["need"] = max(0, round(it["today_min"] - booked.get(it["key"], 0)))
     if rank:
         items, _ = ranker.rank(items, cfg["ollama"], today)
+    items = habits.today_items(cfg, state, now, lambda key: habits.minutes_on(state, key, today)) + items
     cap_left = pc["max_work_hours_per_day"] * 60 - worked - booked_total
-    return work_free, items, cap_left
+    return free, items, cap_left
 
 
 def summarize(now, habit_blocks, missed_habits, work_blocks, short, used_llm, ranked_several):

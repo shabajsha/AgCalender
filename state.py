@@ -121,6 +121,21 @@ CREATE TABLE IF NOT EXISTS booked_blocks (
     tg_message_id INTEGER,        -- the "Did you finish?" message
     created_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,  -- dotted config key, e.g. "planner.max_work_hours_per_day"
+    value      TEXT,              -- JSON; laid over config.yaml by config.load_config()
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS habits (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT,
+    minutes      INTEGER,
+    days         TEXT,            -- "mon,wed,fri"
+    window_start TEXT,            -- "17:00"
+    window_end   TEXT,
+    active       INTEGER DEFAULT 1,
+    created_at   TEXT
+);
 CREATE TABLE IF NOT EXISTS sender_prefs (
     sender     TEXT PRIMARY KEY,
     pref       TEXT,             -- asked / blocked / keep
@@ -181,7 +196,9 @@ class State:
     def _migrate(self):
         """Adds columns introduced after a table was first created (CREATE TABLE IF NOT EXISTS won't)."""
         added = {"watched_events": [("review", "TEXT"), ("review_batch", "INTEGER")],
-                 "processed_messages": [("subject", "TEXT")]}
+                 "processed_messages": [("subject", "TEXT")],
+                 "plan_items": [("sent_at", "TEXT"), ("window_start", "TEXT")],
+                 "booked_blocks": [("headsup", "INTEGER DEFAULT 0"), ("calendar", "TEXT")]}
         for table, columns in added.items():
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, kind in columns:
@@ -461,8 +478,9 @@ class State:
 
     # --- today's tasks waiting for a time, and the slots you booked (slotpicker.py) ----------------
 
-    PLAN_ITEM_FIELDS = {"title", "due", "list_id", "minutes", "tg_message_id", "status", "reminded", "kind", "sent_at"}
-    BLOCK_FIELDS = {"status", "tg_message_id", "event_id"}
+    PLAN_ITEM_FIELDS = {"title", "due", "list_id", "minutes", "tg_message_id", "status", "reminded", "kind", "sent_at",
+                        "window_start"}
+    BLOCK_FIELDS = {"status", "tg_message_id", "event_id", "headsup", "start", "end", "calendar"}
 
     def plan_item_upsert(self, day, work_key, title, kind, due, list_id, minutes):
         """Today's row for a task: created open, or its title/due/minutes refreshed. Returns the row."""
@@ -498,10 +516,10 @@ class State:
                         (*fields.values(), item_id))
         self.db.commit()
 
-    def block_add(self, item_id, event_id, work_key, title, start, end):
-        cur = self.db.execute("INSERT INTO booked_blocks (item_id, event_id, work_key, title, start, end, status, created_at) "
-                              "VALUES (?, ?, ?, ?, ?, ?, 'booked', ?)",
-                              (item_id, event_id, work_key, title, start.isoformat(), end.isoformat(), _now()))
+    def block_add(self, item_id, event_id, work_key, title, start, end, calendar=None):
+        cur = self.db.execute("INSERT INTO booked_blocks (item_id, event_id, work_key, title, start, end, status, "
+                              "created_at, calendar) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?)",
+                              (item_id, event_id, work_key, title, start.isoformat(), end.isoformat(), _now(), calendar))
         self.db.commit()
         return cur.lastrowid
 
@@ -533,6 +551,74 @@ class State:
         return {r["event_id"]: r["status"] for r in self.db.execute(
             "SELECT event_id, status FROM booked_blocks WHERE status IN ('done', 'partly', 'notdone')")}
 
+    def block_by_event(self, event_id):
+        row = self.db.execute("SELECT * FROM booked_blocks WHERE event_id = ? ORDER BY id DESC", (event_id,)).fetchone()
+        return dict(row) if row else None
+
+    # --- settings changed from Telegram / the web page (settings.py) ---------------------------------
+
+    def settings(self):
+        return {r["key"]: json.loads(r["value"]) for r in self.db.execute("SELECT key, value FROM settings")}
+
+    def set_setting(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?, ?)", (key, json.dumps(value), _now()))
+        self.db.commit()
+
+    def clear_setting(self, key):
+        self.db.execute("DELETE FROM settings WHERE key = ?", (key,))
+        self.db.commit()
+
+    # --- habits (habits.py) --------------------------------------------------------------------------
+
+    def habits(self, active_only=False):
+        sql = "SELECT * FROM habits" + (" WHERE active = 1" if active_only else "") + " ORDER BY id"
+        return [dict(r) for r in self.db.execute(sql)]
+
+    def habit(self, habit_id):
+        row = self.db.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
+        return dict(row) if row else None
+
+    def habit_add(self, name, minutes, days, window_start, window_end):
+        cur = self.db.execute("INSERT INTO habits (name, minutes, days, window_start, window_end, active, created_at) "
+                              "VALUES (?, ?, ?, ?, ?, 1, ?)", (name, minutes, days, window_start, window_end, _now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def habit_set(self, habit_id, **fields):
+        allowed = {"name", "minutes", "days", "window_start", "window_end", "active"}
+        if set(fields) - allowed:
+            raise ValueError(f"unknown habits fields: {set(fields) - allowed}")
+        self.db.execute(f"UPDATE habits SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                        (*fields.values(), habit_id))
+        self.db.commit()
+
+    def habit_delete(self, habit_id):
+        self.db.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
+        self.db.commit()
+
+    # --- a multi-step conversation (typing a value after a button) ------------------------------------
+
+    CONV_MINUTES = 15
+
+    def conv(self, now):
+        """The conversation waiting for your next message ({"flow", ...}), or None (none, or it expired)."""
+        raw = self.get_meta("conv")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        if datetime.fromisoformat(data["expires"]) < now:
+            self.set_meta("conv", "")
+            return None
+        return data
+
+    def set_conv(self, now, flow, **data):
+        data = {k: v for k, v in data.items() if k not in ("flow", "expires")}
+        self.set_meta("conv", json.dumps({"flow": flow, "expires": (now + timedelta(minutes=self.CONV_MINUTES)).isoformat(),
+                                          **data}))
+
+    def clear_conv(self):
+        self.set_meta("conv", "")
+
     def watch_statuses(self):
         """{(cal_id, event_key): status} for everything the watcher knows about."""
         return {(r["cal_id"], r["event_key"]): r["status"] for r in self.db.execute("SELECT cal_id, event_key, status FROM watched_events")}
@@ -548,3 +634,15 @@ class State:
         """Forget a created item (used when a deadline is undone), so it could be added again later."""
         self.db.execute("DELETE FROM created_items WHERE event_id = ?", (event_id,))
         self.db.commit()
+
+
+def read_settings(path=None):
+    """Settings overrides without creating or migrating anything (config.load_config uses this)."""
+    path = Path(path or DB_PATH)
+    if not path.exists():
+        return {}
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            return {k: json.loads(v) for k, v in db.execute("SELECT key, value FROM settings")}
+    except sqlite3.Error:
+        return {}

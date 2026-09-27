@@ -120,6 +120,7 @@ morning:
   wait_minutes: 45             # go ahead without an answer after this long
   latest_checkin: "18:00"      # laptop first on after this: no "good morning" question, just plan what's left
   remind_after_minutes: 120    # a task still without a time gets one reminder (with fresh free slots) this much later
+  heads_up_minutes: 5          # "Next at 15:00: ..." this long before a booked block (0 = off)
   evening_check: "21:30"       # summary of the day: done / not done / no time picked, "Move to tomorrow"
   todo_tasklist: 'MDY3MjgzMjQwODkyOTI3NTU4MzQ6MDow'   # "DAILY TASKS"
   todo_default_minutes: 30     # for to-dos sent without a time
@@ -144,8 +145,8 @@ planner:
   horizon_days: 14             # only deadlines within this many days are planned
   carry_over_days: 3           # your tasks overdue by up to this many days are planned today
 
-# Habits are placed before work, inside their window, on the listed days (mon..sun; omit days = every day).
-# Nothing is placed until you add your own. Examples:
+# Habits: add them from Telegram with /habits (stored in state.db). Any listed here are imported once.
+# Each gets free slots inside its window on its days (mon..sun; omit days = every day). Examples:
 #   - name: Gym
 #     minutes: 60
 #     window: ["06:30", "09:00"]

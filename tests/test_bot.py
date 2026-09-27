@@ -45,7 +45,7 @@ def say(bot, text, age=0):
 def test_add_offers_effort_then_stores_it(bot, tg, db):
     approvals.ask(tg, db, "k1", deadline(), {"id": "m", "subject": "Midsem"}, "prof@iiit.ac.in")
     tap(bot, "add:1")
-    assert [[label for label, _ in row] for row in tg.edits[101]["buttons"]] == [["2 h", "4 h", "8 h"], ["12 h", "20 h", "30 h"]]
+    assert [[label for label, _ in row] for row in tg.edits[101]["buttons"]] == [["2 h", "4 h", "8 h"], ["12 h", "20 h", "30 h"], ["Undo (10 min)"]]
     assert db.item_exists("k1") and db.get_pending(1)["status"] == "added"
     tap(bot, "effort:1:20")
     assert db.get_effort("event:EV1") == 20 and tg.answers[-1] == "20 h"

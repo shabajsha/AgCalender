@@ -78,10 +78,21 @@ def _chunk(row, pc):
     return min(_round15(row["minutes"]), pc["block_minutes"])
 
 
-def _pick(work_free, row, pc, now, spread=True, count=SHOWN):
+def window_free(free, row, pc, now):
+    """The free time this task may use: its habit window, else work hours."""
+    due = datetime.fromisoformat(row["due"])
+    start = row.get("window_start") or pc["work_window"][0]
+    end = due if row["kind"] == "habit" else slots.at(now.date(), pc["work_window"][1], now.tzinfo)
+    return slots.intersect(free, (slots.at(now.date(), start, now.tzinfo), end))
+
+
+def _pick(free, row, pc, now, spread=True, count=SHOWN):
     """(chunk, options): shorter blocks if nothing of the usual length is free."""
     due, gap = datetime.fromisoformat(row["due"]), pc["gap_minutes"]
-    chunk = _chunk(row, pc)
+    work_free = window_free(free, row, pc, now)
+    if row["kind"] == "habit":
+        gap = 0  # a habit may run to the end of its window
+    chunk = _chunk(row, pc) if row["kind"] != "habit" else _round15(row["minutes"])
     for size in dict.fromkeys([chunk, min(chunk, 60), min(chunk, pc["min_block_minutes"])]):
         found = options(work_free, size, due, gap, count, spread)
         if found:
@@ -92,8 +103,9 @@ def _pick(work_free, row, pc, now, spread=True, count=SHOWN):
 def render(row, chunk, opts, note=""):
     due = datetime.fromisoformat(row["due"])
     what = "prep" if row["kind"] == "exam" else "to do"
-    lines = ([note, ""] if note else []) + [row["title"],
-             f"{fmt(row['minutes'])} {what} today (due {due:%a %d %b %H:%M})."]
+    head = (f"{fmt(row['minutes'])} today, between {row['window_start']} and {due:%H:%M}." if row["kind"] == "habit"
+            else f"{fmt(row['minutes'])} {what} today (due {due:%a %d %b %H:%M}).")
+    lines = ([note, ""] if note else []) + [row["title"] + (" (habit)" if row["kind"] == "habit" else ""), head]
     if not opts:
         lines.append("No free slot is left today before it's due. Tap Not today to move it to tomorrow.")
     elif chunk < row["minutes"]:
@@ -129,6 +141,8 @@ def prepare(cfg, state, now, cal, tasks_api, rank=True):
         wanted.add(it["key"])
         row = state.plan_item_upsert(today, it["key"], it["title"], it.get("kind", "task"), it["due"].isoformat(),
                                      it.get("list_id"), it["need"])
+        if it.get("window_start") and row.get("window_start") != it["window_start"]:
+            state.plan_item_set(row["id"], window_start=it["window_start"])
         if row["status"] == "open" and it["need"] <= 0:
             state.plan_item_set(row["id"], status="booked")
         elif row["status"] == "booked" and it["need"] > 0:
@@ -144,8 +158,9 @@ def morning_lines(state, today, cap_left, pc):
     rows = state.plan_items(today, statuses=["open"])
     if not rows:
         return ["- Nothing needs time today."]
-    lines = [f"- {r['title']}: {fmt(r['minutes'])}" + (" (exam prep)" if r["kind"] == "exam" else "") for r in rows]
-    total = sum(r["minutes"] for r in rows)
+    lines = [f"- {r['title']}: {fmt(r['minutes'])}" + {"exam": " (exam prep)", "habit": " (habit)"}.get(r["kind"], "")
+             for r in rows]
+    total = sum(r["minutes"] for r in rows if r["kind"] != "habit")  # habits don't count toward the work limit
     if cap_left <= 0:
         lines.append(f"Today already has {pc['max_work_hours_per_day']:g} h of work planned (your daily limit), so this "
                      "would be extra. Pick what you really want to do and tap Not today on the rest.")
@@ -174,8 +189,9 @@ def send_waiting(cfg, state, now, tg, work_free, resend=False):
 def handle(listener, cq, action, rest, now):
     cfg, state, tg = listener.cfg, listener.state, listener.tg
     pc, today, message_id = cfg["planner"], now.date(), cq["message"]["message_id"]
-    if action in ("bkd", "eve", "prep"):
-        return {"bkd": _answer_block, "eve": _evening_answer, "prep": _set_prep}[action](listener, message_id, rest, now)
+    if action in ("bkd", "eve", "prep", "hu", "mvb"):
+        return {"bkd": _answer_block, "eve": _evening_answer, "prep": _set_prep, "hu": _heads_up_answer,
+                "mvb": _move_to}[action](listener, message_id, rest, now)
     raw_id, _, arg = rest.partition(":")
     row = state.plan_item(int(raw_id)) if raw_id.isdigit() else None
     if row is None:
@@ -205,10 +221,12 @@ def handle(listener, cq, action, rest, now):
         chunk, opts = _pick(work_free, row, pc, now)
         tg.edit(message_id, *render(row, chunk, opts, note="That time isn't free any more. Current free slots:"))
         return
-    event_id = google_writer.create_block(listener.calendar, cfg["calendars"]["planner"], f"Work: {row['title']}",
-                                          start, end, cfg["timezone"], "work", work_key=row["work_key"],
+    habit = row["kind"] == "habit"
+    calendar_id = cfg["calendars"]["habits" if habit else "planner"]
+    event_id = google_writer.create_block(listener.calendar, calendar_id, row["title"] if habit else f"Work: {row['title']}",
+                                          start, end, cfg["timezone"], "habit" if habit else "work", work_key=row["work_key"],
                                           note=f"Due {datetime.fromisoformat(row['due']):%a %d %b %H:%M}; you picked this time")
-    state.block_add(row["id"], event_id, row["work_key"], row["title"], start, end)
+    state.block_add(row["id"], event_id, row["work_key"], row["title"], start, end, calendar=calendar_id)
     left = max(0, row["minutes"] - int(minutes))
     state.plan_item_set(row["id"], minutes=left, status="open" if left > 0 else "booked")
     work_free = slots.subtract(work_free, slots.pad([(start, end)], pc["gap_minutes"]))
@@ -225,7 +243,7 @@ def handle(listener, cq, action, rest, now):
 
 def _answer_block(listener, message_id, rest, now):
     """bkd:<block id>:<d|p|x> - the answer to "Did you finish ...?"."""
-    state, tg, cfg = listener.state, listener.tg, listener.cfg
+    state, tg = listener.state, listener.tg
     raw_id, _, answer = rest.partition(":")
     block = state.block(int(raw_id)) if raw_id.isdigit() else None
     if block is None or block["status"] not in ("booked", "asked"):
@@ -236,23 +254,16 @@ def _answer_block(listener, message_id, rest, now):
     state.block_set(block["id"], status=status)
     if status == "done":
         ticked = _maybe_complete(listener, block)
-        tg.edit(message_id, f"Done: {block['title']}." + (" Ticked off in your tasks." if ticked else ""))
+        note = " Ticked off in your tasks." if ticked else ""
+        if (block["work_key"] or "").startswith("habit:"):
+            import habits
+            habit = state.habit(int(block["work_key"].split(":")[1]))
+            run = habits.streak(state, habit, now.date()) if habit else 0
+            note = f" Streak: {run} day{'s' if run != 1 else ''}." if run else ""
+        tg.edit(message_id, f"Done: {block['title']}.{note}")
         return
     # Partly / Not done: offer new times for what's left (today if there's room, else Not today = tomorrow)
-    work_free, items, _ = planner.work_context(cfg, state, now, listener.calendar, listener.tasks)
-    item = next((it for it in items if it["key"] == block["work_key"]), None)
-    label = "Partly done" if status == "partly" else "Not done"
-    if item is None or item["need"] <= 0:
-        tg.edit(message_id, f"{label}: {block['title']}. It'll be in tomorrow's suggestions.")
-        return
-    row = state.plan_item_upsert(now.date(), item["key"], item["title"], item.get("kind", "task"), item["due"].isoformat(),
-                                 item.get("list_id"), item["need"])
-    state.plan_item_set(row["id"], status="open")
-    row = state.plan_item(row["id"])
-    chunk, opts = _pick(work_free, row, cfg["planner"], now)
-    text, buttons = render(row, chunk, opts, note=f"{label}: {block['title']}. Pick a new time?")
-    tg.edit(message_id, text, buttons)
-    state.plan_item_set(row["id"], tg_message_id=message_id)
+    _reoffer(listener, message_id, block, now, "Partly done" if status == "partly" else "Not done")
 
 
 def _task_ref(listener, work_key, list_id):
@@ -414,3 +425,97 @@ def _set_prep(listener, message_id, rest, now):
     event_id, _, hours = rest.rpartition(":")
     listener.state.set_effort(f"event:{event_id}", float(hours))
     listener.tg.edit(message_id, *exams_message(listener.cfg, listener.state, now, listener.calendar))
+
+
+# --- heads-up before a booked block (the listener checks every minute) ---------------------------------------
+
+def heads_up(listener, now):
+    """ "Next at 15:00: Study SDET MidSem (1 h 30 min)" with Start / Push 30 min / Skip, heads_up_minutes before."""
+    lead = listener.cfg["morning"].get("heads_up_minutes", 5)
+    if not lead or _asleep(listener.cfg, now):
+        return
+    for b in listener.state.blocks(statuses=["booked"]):
+        start = datetime.fromisoformat(b["start"]).astimezone(now.tzinfo)
+        if b["headsup"] or not now < start <= now + timedelta(minutes=lead):
+            continue
+        end = datetime.fromisoformat(b["end"]).astimezone(now.tzinfo)
+        listener.tg.send(f"Next at {start:%H:%M}: {b['title']} ({fmt((end - start).total_seconds() / 60)})",
+                         [[("Start", f"hu:{b['id']}:s"), ("Push 30 min", f"hu:{b['id']}:p"), ("Skip", f"hu:{b['id']}:k")]])
+        listener.state.block_set(b["id"], headsup=1)
+
+
+def _heads_up_answer(listener, message_id, rest, now):
+    import actions
+    raw_id, _, op = rest.partition(":")
+    block = listener.state.block(int(raw_id)) if raw_id.isdigit() else None
+    if block is None or block["status"] != "booked":
+        return
+    if op == "s":
+        listener.tg.edit(message_id, f"Started: {block['title']}. I'll ask how it went when it ends.")
+        return
+    if op == "k":
+        actions.skip_block(listener.cfg, listener.state, listener.calendar, block)
+        _reoffer(listener, message_id, block, now, "Skipped")
+        return
+    start, end = (datetime.fromisoformat(block[k]).astimezone(now.tzinfo) for k in ("start", "end"))
+    ok, text, alternatives = actions.move_block(listener.cfg, listener.state, listener.calendar, block,
+                                                start + timedelta(minutes=30), end + timedelta(minutes=30), now)
+    listener.tg.edit(message_id, text if ok else f"{text} Move it to:", None if ok else _move_buttons(block, alternatives))
+
+
+def _move_buttons(block, alternatives):
+    rows = [[(f"{s:%H:%M}-{e:%H:%M}", f"mvb:{block['id']}:{s:%Y%m%d%H%M}") for s, e in alternatives]]
+    return rows + [[("Skip it", f"hu:{block['id']}:k")]]
+
+
+def _move_to(listener, message_id, rest, now):
+    """mvb:<block>:<YYYYMMDDHHMM> - move a block to one of the offered times."""
+    import actions
+    raw_id, _, stamp = rest.partition(":")
+    block = listener.state.block(int(raw_id)) if raw_id.isdigit() else None
+    if block is None or len(stamp) != 12:
+        return
+    start = datetime.strptime(stamp, "%Y%m%d%H%M").replace(tzinfo=now.tzinfo)
+    length = datetime.fromisoformat(block["end"]) - datetime.fromisoformat(block["start"])
+    ok, text, alternatives = actions.move_block(listener.cfg, listener.state, listener.calendar, block, start,
+                                                start + length, now)
+    listener.tg.edit(message_id, text if ok else f"{text} Try one of these:", None if ok else _move_buttons(block, alternatives))
+
+
+def _reoffer(listener, message_id, block, now, label):
+    """After Skip / Not done: new times for what's left today."""
+    cfg, state = listener.cfg, listener.state
+    free, items, _ = planner.work_context(cfg, state, now, listener.calendar, listener.tasks)
+    item = next((it for it in items if it["key"] == block["work_key"]), None)
+    if item is None or item["need"] <= 0:
+        listener.tg.edit(message_id, f"{label}: {block['title']}. It'll be in tomorrow's suggestions.")
+        return
+    row = state.plan_item_upsert(now.date(), item["key"], item["title"], item.get("kind", "task"), item["due"].isoformat(),
+                                 item.get("list_id"), item["need"])
+    state.plan_item_set(row["id"], status="open", **({"window_start": item["window_start"]} if item.get("window_start") else {}))
+    row = state.plan_item(row["id"])
+    chunk, opts = _pick(free, row, cfg["planner"], now)
+    listener.tg.edit(message_id, *render(row, chunk, opts, note=f"{label}: {block['title']}. Pick a new time?"))
+    state.plan_item_set(row["id"], tg_message_id=message_id)
+
+
+# --- /today ---------------------------------------------------------------------------------------------
+
+STATUS_TEXT = {"booked": "", "asked": " - how did it go? (question above)", "done": " - done", "partly": " - partly done",
+               "notdone": " - not done", "busy": " - busy"}
+
+
+def today_message(cfg, state, cal, now):
+    import digest
+    today = now.date()
+    lines = [f"Today - {now:%a %d %b}", "", "Events"] + digest.events_today(cfg, cal, state, now)
+    blocks = [b for b in state.blocks() if datetime.fromisoformat(b["start"]).astimezone(now.tzinfo).date() == today
+              and b["status"] != "cleared"]
+    lines += ["", "Your blocks"] + ([f"- {datetime.fromisoformat(b['start']).astimezone(now.tzinfo):%H:%M}-"
+                                    f"{datetime.fromisoformat(b['end']).astimezone(now.tzinfo):%H:%M}  {b['title']}"
+                                    f"{STATUS_TEXT.get(b['status'], '')}" for b in blocks] or ["- None booked yet"])
+    waiting = [r for r in state.plan_items(today, statuses=["open"]) if r["minutes"] > 0]
+    if waiting:
+        lines += ["", "No time picked yet"] + [f"- {r['title']}: {fmt(r['minutes'])}" for r in waiting]
+    buttons = [[("Plan rest of today", "tdp:"), ("Clear today's plan", f"clear:{today.isoformat()}")]]
+    return "\n".join(lines), buttons

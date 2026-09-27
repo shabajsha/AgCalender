@@ -214,3 +214,10 @@ def move_deadline(calendar, tasks, cfg, event_id, task_id, due):
     if task_id:
         tasks.tasks().patch(tasklist=cfg.get("tasklist", "@default"), task=task_id,
                             body={"due": f"{due.date().isoformat()}T00:00:00.000Z"}).execute()
+
+
+def move_event(calendar, calendar_id, event_id, start, end, tz_name):
+    """Moves one of the agent's blocks to a new time."""
+    calendar.events().patch(calendarId=calendar_id, eventId=event_id, body={
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name}}).execute()
