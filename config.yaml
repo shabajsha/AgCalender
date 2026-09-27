@@ -109,6 +109,13 @@ calendar_watch:
     'en.indian#holiday@group.v.calendar.google.com': show                   # Holidays in India
     'family16044744448832549624@group.calendar.google.com': ignore          # Family
 
+# --- Web page (web/app.py, http://localhost:8765) ---
+# From your phone: install Tailscale, run `sudo tailscale serve --bg 8765`, then add the https name it shows here.
+# Never use `tailscale funnel` (that would put the page on the public internet).
+web:
+  allowed_hosts: []            # e.g. ["sha-omen.tail1234.ts.net"]
+  tailscale_user: ""           # your Tailscale login (e.g. you@gmail.com): only that login gets in via Tailscale
+
 # --- Morning digest (Phase 2) ---
 digest:
   days_ahead: 7

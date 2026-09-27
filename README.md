@@ -26,13 +26,20 @@ They are listed in `.gitignore`.
 | `morning.py` | Morning routine: check-in question on Telegram, then plan + one combined morning message. `--tick` (timer), `--finish`, `--start` (test). |
 | `todos.py` | Parses to-dos you send ("Lab report 2h") and adds/undoes them in DAILY TASKS, due today. |
 | `planner.py` | Works out today's work (deadlines, exam prep, to-dos, dated tasks) and your free time. Default: send free slots to pick from (`--suggest-new` for a new to-do only); `--print` previews an automatic plan; `--place` / `--auto` place blocks without asking (old behaviour); `--clear [--date]`. |
+| `actions.py` | Checked plan changes shared by the bot, typed commands and the web page: move / book / skip a block, block out busy time, finish or drop a deadline. A new time must be free. |
+| `nlcommands.py` | Change your plan by typing it ("move SDET study to 7pm"); rules first, the local model for other phrasings; always confirmed. |
+| `habits.py` | Habits from Telegram (/habits): guided set-up, pause/delete, streaks; offered as free slots on their days. |
+| `deadlines.py` | /deadlines: Done / Effort / Date / Not doing for each upcoming deadline. |
+| `changes.py` | An email or invite that moves or cancels something you have: "Changed?" / "Cancelled?" cards instead of duplicates. |
+| `settings.py` | Settings you can change from Telegram (/settings) or the web page, validated; stored in state.db over config.yaml. |
+| `web/` | The web page (`web/app.py`, Flask, 127.0.0.1:8765): drag your blocks on a day timeline, plus tasks, deadlines, to-dos, habits, settings. `calendar-web.service`. |
 | `slotpicker.py` | You choose when: one Telegram message per task with free slots as buttons, booking, "Did you finish?" after each slot, one reminder, the evening check, `/exams`. |
 | `slots.py` | Free-time arithmetic (subtract busy time, sleep, gaps; place blocks). Pure Python, no LLM. |
 | `ranker.py` | Asks the model only to *order* the open work; falls back to earliest-due-first. |
 | `llm.py` | The single guarded Ollama call (RAM check, GPU check, timeout) used by `extractor.py` and `ranker.py`. |
 | `digest.py` | Morning digest: today's events, deadlines in the next 7 days, deadlines with no Planner work block, your own tasks due, items waiting for Add / Skip. `--print` to preview. |
 | `notifiers.py` | Pluggable delivery (`desktop` = notify-send, `telegram`). Add a function to `CHANNELS` for a new channel. |
-| `systemd/` | User units: `calendar-ingest.timer` (every 30 min), `calendar-approvals.service` (always on), `calendar-morning.timer` (check-in, plan, morning message). `calendar-digest.timer` / `calendar-planner.timer` are the older separate versions, now disabled. |
+| `systemd/` | User units: `calendar-ingest.timer` (every 30 min), `calendar-approvals.service` (always on), `calendar-web.service` (the web page), `calendar-morning.timer` (check-in, plan, morning message). `calendar-digest.timer` / `calendar-planner.timer` are the older separate versions, now disabled. |
 | `calwatch.py` | Watches your other calendars (timetable, contests, Outlook, Moodle): Track / Ignore cards, copies tracked events into College and keeps them in step with the original. |
 | `alerts.py` | Tells you on Telegram (else desktop) when something needs you: expired Google login, Ollama lost the GPU, repeated mail-check errors, an email given up on. Once per problem per 6 h. |
 | `logsetup.py` | One rotating log file per script in `logs/` (1 MB, 3 kept). |
@@ -192,6 +199,11 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | `/check`, **Check mail now** | Runs a mail check immediately instead of waiting for the next 30-minute run. |
 | `/plan`, **Plan rest of today** | Sends each task that still needs time today, with free slots to pick from. Nothing is booked until you tap a time. |
 | `/exams` | Exams in the next 2 weeks and how much preparation each gets; tap to change (or none). |
+| `/today`, **Today** | Today's events, your blocks with how they went, tasks still without a time. |
+| `/deadlines`, **Deadlines** | Each upcoming deadline with Done / Effort / Date (+1 day, +2 days, +1 week, or type one) / Not doing. |
+| `/habits`, **Habits** | Your habits with streaks; New habit walks you through name, length, days and time of day. |
+| `/settings`, **Settings** | Work hours, sleep, daily limit, block length, morning time, reminders, heads-up, evening check, exam prep... |
+| *typing a change* | "move SDET study to 7pm", "leetcode not today", "busy 2-5pm", "make midsem prep 10 hours", "add gym at 6pm for 1h", "swap SMAI and SDET A2", "push leetcode by 30 min". Always asks Yes / Cancel first. |
 | `/clear` | Removes today's planner-made blocks that haven't started (also the **Clear today's plan** button). Blocks already worked stay: later plans count them as done. |
 | `/pause` | Stops reading mail. Your other calendars are still checked, buttons on existing cards still work, and the digest still arrives, noting the pause. |
 | `/skipped` | Emails the pre-filter skipped (no deadline words), newest first, with **Read** buttons to run the model on one anyway. |
@@ -263,6 +275,44 @@ Study SDET MidSem
 - `/todo` after the morning sends free slots for the new to-do straight away.
 - The daily limit (`max_work_hours_per_day`) is a warning, never a silent drop.
 
+## Typing changes, habits, deadlines, settings
+
+- **Type what you want changed.** Common phrasings are understood by fixed rules (this works with the GPU off); for
+  anything else the local model says what you meant, but never works out times. The task is found by its title,
+  times are worked out in Python, and the new time must be free. You always get **Yes / Cancel** first; if the time
+  isn't free you get the nearest free times as buttons. Only the agent's own blocks are ever moved.
+- **Heads-up** `morning.heads_up_minutes` (5) before each booked block: *Next at 15:00: ...* with **Start**,
+  **Push 30 min** (moved if that's free, else other times offered) and **Skip** (removed; planned again later).
+- **Habits** (`/habits` -> New habit): name, length, days, time of day. On its days a habit gets free slots inside
+  its window like any task (on the Habits calendar); *Did you finish?* afterwards keeps a **streak**.
+- **Deadlines** (`/deadlines`): Done ticks the task off and removes its upcoming work; Date moves the DUE event and
+  task; Not doing deletes them after you confirm. After tapping **Add** on an email card you can **Undo** for 10 min.
+- **Emails that move or cancel something you already have** ("SDET midsem postponed to Friday", "quiz cancelled") ask
+  *Changed? Was ... Now ...* (Move it / Add as new / Ignore) or *Cancelled?* (Remove it / Keep it) instead of adding a
+  duplicate. Titles must match closely and numbers exactly ("Assignment 2" is never "Assignment 3"). Updated or
+  cancelled invites are matched by their UID.
+- **Settings** (`/settings`, or the web page): each change is checked and stored in `state.db`; every script uses it
+  from its next run. Reset goes back to `config.yaml`.
+
+## Web page
+
+`calendar-web.service` serves **http://localhost:8765** on the laptop: a day timeline (your events in grey, work in
+blue, habits in green; **drag a block to move it, drag its bottom edge to resize**; a time that isn't free snaps back
+with the nearest free times), "Did you finish?", tasks that need a time (tap a slot), to-dos, deadlines, habits,
+settings, and Check mail / Plan rest of today / Pause.
+
+Safety: it only listens on 127.0.0.1; requests need an allowed Host/Origin (localhost + `web.allowed_hosts`) and the
+page's CSRF token; with `web.tailscale_user` set only your Tailscale login gets in.
+
+**From your phone (once, needs sudo):**
+1. Install Tailscale on the laptop (`curl -fsSL https://tailscale.com/install.sh | sh`) and run `sudo tailscale up`.
+2. Install the Tailscale app on your phone and sign in with the same account.
+3. On the laptop: `sudo tailscale serve --bg 8765`. It prints `https://<laptop>.<tailnet>.ts.net`.
+4. Put that name in `config.yaml` -> `web.allowed_hosts` (and your login in `web.tailscale_user`), then
+   `systemctl --user restart calendar-web`. Open the https address on your phone.
+Never use `tailscale funnel`: that would put the page on the public internet. The page only works while the laptop
+is on.
+
 ## Morning check-in
 
 The first time the laptop is on after `planner.plan_after` (06:45), the bot asks **"What do you want to get done
@@ -297,7 +347,7 @@ systemctl --user enable --now calendar-morning.timer
 
 ```bash
 venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-venv/bin/python -m pytest            # ~190 tests, a few seconds, never touches your real accounts
+venv/bin/python -m pytest            # ~260 tests, a few seconds, never touches your real accounts
 git log --oneline                    # history; each phase is one or more commits
 ```
 

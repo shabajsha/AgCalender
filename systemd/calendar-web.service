@@ -1,0 +1,13 @@
+[Unit]
+Description=Calendar agent: web page (drag your blocks, tasks, deadlines, habits, settings) on 127.0.0.1:8765
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/calender-agent
+ExecStart=%h/Documents/calender-agent/venv/bin/python web/app.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

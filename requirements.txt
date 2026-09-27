@@ -5,3 +5,4 @@ pyyaml
 icalendar
 python-dateutil
 requests
+flask

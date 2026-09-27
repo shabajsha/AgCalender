@@ -1,7 +1,7 @@
 """Typed plan changes: understood, resolved in Python, confirmed before anything moves."""
 import itertools
 import json
-from datetime import timedelta
+
 from types import SimpleNamespace
 
 import pytest

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf }}">
+  <title>Calendar agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="bar">
+    <div class="day-nav">
+      <button id="prev" aria-label="Previous day">&lsaquo;</button>
+      <h1 id="day-title">Today</h1>
+      <button id="next" aria-label="Next day">&rsaquo;</button>
+      <button id="today" class="small">Today</button>
+    </div>
+    <div class="controls">
+      <button id="check">Check mail</button>
+      <button id="plan">Plan rest of today</button>
+      <button id="pause">Pause mail</button>
+    </div>
+  </header>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <main>
+    <section class="timeline-wrap" aria-label="Day timeline">
+      <div class="legend"><span class="dot event"></span>your events <span class="dot work"></span>work
+        <span class="dot habit"></span>habit <span class="dot busy"></span>busy
+        <span class="hint">Drag a block to move it; drag its bottom edge to resize.</span></div>
+      <div id="allday"></div>
+      <div id="timeline"></div>
+    </section>
+
+    <section class="panels">
+      <div class="panel" id="asked-panel">
+        <h2>Did you finish?</h2>
+        <ul id="asked"></ul>
+      </div>
+      <div class="panel">
+        <h2>Needs a time today</h2>
+        <ul id="waiting"></ul>
+      </div>
+      <div class="panel">
+        <h2>Add to-dos for today</h2>
+        <form id="todo-form">
+          <textarea id="todo-text" rows="3" placeholder="Lab report 2h&#10;Call bank 15m"></textarea>
+          <button type="submit">Add</button>
+        </form>
+      </div>
+      <div class="panel">
+        <h2>Deadlines</h2>
+        <ul id="deadlines"></ul>
+      </div>
+      <div class="panel">
+        <h2>Habits</h2>
+        <ul id="habits"></ul>
+        <details>
+          <summary>New habit</summary>
+          <form id="habit-form" class="grid">
+            <label>Name <input name="name" required maxlength="60" placeholder="Gym"></label>
+            <label>Minutes <input name="minutes" type="number" min="5" max="600" value="60"></label>
+            <fieldset class="days"><legend>Days</legend>
+              <label><input type="checkbox" value="mon" checked>Mon</label><label><input type="checkbox" value="tue">Tue</label>
+              <label><input type="checkbox" value="wed" checked>Wed</label><label><input type="checkbox" value="thu">Thu</label>
+              <label><input type="checkbox" value="fri" checked>Fri</label><label><input type="checkbox" value="sat">Sat</label>
+              <label><input type="checkbox" value="sun">Sun</label>
+            </fieldset>
+            <label>From <input name="window_start" type="time" value="17:00"></label>
+            <label>To <input name="window_end" type="time" value="21:00"></label>
+            <button type="submit">Save habit</button>
+          </form>
+        </details>
+      </div>
+      <div class="panel">
+        <h2>Settings</h2>
+        <ul id="settings"></ul>
+      </div>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
