@@ -12,7 +12,23 @@ log = logging.getLogger(__name__)
 DESKTOP_MAX_CHARS = 900  # desktop popups get unreadable beyond this; the full text is in logs/digest.md
 
 
+def fullscreen_active():
+    """True if the focused window is fullscreen (a game, a video): desktop popups wait, Telegram still gets it."""
+    try:
+        root = subprocess.run(["xprop", "-root", "_NET_ACTIVE_WINDOW"], capture_output=True, text=True, timeout=3).stdout
+        window = root.strip().split()[-1]
+        if not window.startswith("0x") or int(window, 16) == 0:
+            return False
+        props = subprocess.run(["xprop", "-id", window, "_NET_WM_STATE"], capture_output=True, text=True, timeout=3).stdout
+        return "_NET_WM_STATE_FULLSCREEN" in props
+    except Exception:  # noqa: BLE001 - no X display / xprop: assume not fullscreen
+        return False
+
+
 def desktop(title, text, buttons=None):
+    if fullscreen_active():
+        log.info("a fullscreen app is open: desktop popup %r skipped (Telegram still gets it)", title)
+        return
     body = text if len(text) <= DESKTOP_MAX_CHARS else text[:DESKTOP_MAX_CHARS] + "\n... (full digest in logs/digest.md)"
     subprocess.run(["notify-send", "--app-name=Calendar agent", "--expire-time=0", title, body], check=True, timeout=15)
 

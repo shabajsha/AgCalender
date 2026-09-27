@@ -252,9 +252,10 @@ def handle_text(listener, text, now):
         try:
             titles = [c["title"] for c in targets(listener.cfg, listener.state, listener.calendar, now)]
             parsed = parse_llm(listener.cfg, listener.state, text, titles)
-        except (LLMUnavailable, LLMTimeout, ValueError):
-            listener.tg.send("I couldn't work that out (the model isn't available right now). These always work:\n"
-                             + "\n".join(f"- {e}" for e in EXAMPLES))
+        except (LLMUnavailable, LLMTimeout, ValueError) as e:
+            why = "the GPU is busy (a game?), so the model is paused" if "GPU" in str(e) or "RAM" in str(e) \
+                else "the model isn't available right now"
+            listener.tg.send(f"I couldn't work that out ({why}). These always work:\n" + "\n".join(f"- {e}" for e in EXAMPLES))
             return True
         except Exception:  # noqa: BLE001 - not understood: the caller shows the help instead
             log.exception("couldn't interpret %r", text)

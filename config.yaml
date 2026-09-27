@@ -23,6 +23,9 @@ ollama:
   min_free_ram_gb: 3     # postpone LLM calls when less RAM than this is free (avoids OOM kills)
   timeout_s: 300
   require_gpu: true       # if Ollama lost the GPU (runs on CPU only), unload and stop instead of cooking the CPU
+  defer_when_gpu_busy: true    # a game (or anything) using the GPU: don't load the model; emails wait, no alert
+  gpu_busy_vram_mb: 1500       # "busy" = other programs use this much GPU memory...
+  gpu_busy_percent: 60         # ...or the GPU is this busy
 min_confidence: 0.6      # LLM items below this are dropped
 first_run_days: 3        # how far back the very first run looks (use --since to backfill more)
 tasklist: 'eWc5RXUwZk1tZjBoWlVvRg'   # Google Tasks list "College" (created by the agent)

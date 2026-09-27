@@ -46,6 +46,7 @@ They are listed in `.gitignore`.
 | `gtasks.py` | Paged Google Tasks helpers shared by the planner and the digest. |
 | `tests/` | pytest suite (no network: a fixture blocks Telegram, Google (httplib2), Ollama (httpx), systemd and the real login). `test_fixes.py` / `test_calfixes.py` hold one regression test per bug from the 26 Sep audit. Run `venv/bin/python -m pytest`. |
 | `eval_extractor.py` | Benchmarks Ollama models on 13 made-up emails with known answers: accuracy, speed, GPU fit, CPU temperature. `python eval_extractor.py gemma2:9b gemma3:4b` |
+| `status.py` | Is it running? Services, timers, last runs, login, GPU, recent problems, web page - one look. |
 | `list_calendars.py` | Prints your calendars' names and IDs, for filling in `config.yaml`. |
 | `test_gmail.py` | Prints the 5 newest emails matching `gmail_query`, to check the query works. |
 | `requirements.txt` | Python dependencies. |
@@ -347,6 +348,29 @@ systemctl --user daemon-reload
 systemctl --user disable --now calendar-planner.timer calendar-digest.timer
 systemctl --user enable --now calendar-morning.timer
 ```
+
+## Is it running?
+
+- **On the laptop:** `venv/bin/python status.py` - services and timers, last mail and calendar check, today's
+  morning, Google login, GPU, emails waiting, problems in the last 24 h, web page. Ends with "All good." or points at
+  the lines marked `!!`.
+- **On your phone:** send `/status` to the bot (the same health, plus Pause / Resume).
+- **By hand:** `systemctl --user status calendar-approvals calendar-web`, `systemctl --user list-timers 'calendar-*'`,
+  `journalctl --user -u calendar-ingest -n 30`, and the files in `logs/`.
+- If something breaks you get a Telegram alert (desktop popup if Telegram can't be reached), at most once per problem
+  every 6 hours. Being offline is not an alert unless it lasts 6 hours.
+
+## While you're gaming
+
+- **The model never fights your game for the GPU.** Before loading it, the agent checks the GPU (`nvidia-smi`): if
+  other programs use more than `ollama.gpu_busy_vram_mb` (1.5 GB) of GPU memory, or the GPU is more than
+  `gpu_busy_percent` (60%) busy, the model isn't loaded. The email just waits for a later mail check (every 30 min) -
+  no alert, no error. `/status` shows how many are waiting. Low RAM is treated the same way.
+- Everything else is light: the mail and calendar checks every 30 minutes take a few seconds of CPU at low priority
+  (`Nice=10`), and the Telegram bot and web page sleep until something happens.
+- **No desktop popups over a fullscreen window** (game or video); Telegram still gets everything, on your phone.
+- Optional, so Ollama can never take many CPU cores even when it does run: `sudo systemctl edit ollama` and add
+  `[Service]` / `Nice=15` / `CPUQuota=400%`.
 
 ## Development
 

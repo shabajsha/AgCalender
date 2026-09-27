@@ -47,6 +47,9 @@ def alert(key, text, state=None):
     try:
         Telegram.from_file().send(f"Calendar agent needs attention:\n{text}")
     except (TelegramError, OSError, ValueError, KeyError):
+        from notifiers import fullscreen_active
+        if fullscreen_active():
+            return False  # no popup over a game; not marked as sent, so it's tried again next time
         try:
             subprocess.run(["notify-send", "--app-name=Calendar agent", "--urgency=critical",
                             "Calendar agent needs attention", text], timeout=15)

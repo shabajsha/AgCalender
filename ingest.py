@@ -26,6 +26,7 @@ import logsetup
 from auth import get_credentials
 from config import load_config
 from extractor import LLMUnavailable, UnreadableAnswer, extract_items, matches_keywords
+from llm import LLMDeferred
 from gmail_reader import fetch_messages, fetch_one, fingerprint, sender_address
 from ics_import import cancelled_uids, is_past, parse_ics
 from state import State, dedupe_key
@@ -233,7 +234,7 @@ def main():
     prefix = "DRY RUN - " if args.dry_run else ""
     log.info("%sfetching %r after %s", prefix, cfg["gmail_query"], after.astimezone().strftime("%Y-%m-%d %H:%M"))
     stats = {"seen": 0, "already": 0, "duplicate": 0, "skipped-sender": 0, "no-keyword": 0,
-             "created": 0, "asked": 0, "skipped-existing": 0, "errors": 0, "given-up": 0, "waiting": 0}
+             "created": 0, "asked": 0, "skipped-existing": 0, "errors": 0, "given-up": 0, "waiting": 0, "deferred": 0}
 
     def already_processed(msg_id):  # checked before download, so old mail isn't fetched again every run
         stats["seen"] += 1
@@ -287,7 +288,10 @@ def main():
                 stats["created"] += 1
             state.mark_processed(msg["id"], fp, "items" if items else outcome,
                                  subject=msg["subject"][:200] if outcome == "no-keyword" and not items else None)
-        except LLMUnavailable as e:  # temporary (RAM, GPU, Ollama down): retry without counting it against the email
+        except LLMDeferred as e:  # GPU busy (a game) or low RAM: just wait, it's not a problem
+            stats["deferred"] += 1
+            log.info("model not used now (%s); %r waits for a later run", e, msg["subject"])
+        except LLMUnavailable as e:  # temporary (GPU lost, Ollama down): retry without counting it against the email
             stats["errors"] += 1
             stats["waiting"] += 1
             log.error("Ollama unavailable (%s); will retry %r next run", e, msg["subject"])
@@ -320,9 +324,9 @@ def main():
     watch_calendars(cfg, state, calendar, tasks, tg, args.dry_run)
 
     if not args.dry_run:
-        state.set_meta("llm_waiting", str(stats["waiting"]))
+        state.set_meta("llm_waiting", str(stats["waiting"] + stats["deferred"]))
         check_mail_flow(state, stats["seen"], run_started, args.since is not None)
-        if stats["errors"] == 0:
+        if stats["errors"] == 0 and stats["deferred"] == 0:
             state.set_last_run(run_started)
         error_runs = int(state.get_meta("ingest_error_runs") or 0) + 1 if stats["errors"] else 0
         state.set_meta("ingest_error_runs", str(error_runs))

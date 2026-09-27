@@ -9,6 +9,7 @@ further calls are made at all (emails wait; the planner orders work by due date)
 "Check mail now" in Telegram also tries again straight away (e.g. after `sudo systemctl restart ollama`).
 """
 import logging
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -23,6 +24,11 @@ MAX_ANSWER_TOKENS = 700               # a JSON answer is ~50-300 tokens; stops a
 
 class LLMUnavailable(Exception):
     """Ollama could not be reached, or RAM/GPU state made it unwise to call it. Temporary: retry later."""
+
+
+class LLMDeferred(LLMUnavailable):
+    """Not now: another program (a game) is using the GPU heavily, or RAM is low. The email simply waits for a later
+    run - no alert, and it doesn't count as an error."""
 
 
 class LLMTimeout(Exception):
@@ -43,6 +49,24 @@ def _gpu_share(model):
     for m in ollama.ps().models:
         if m.model == model:
             return (m.size_vram or 0) / m.size if m.size else 0.0
+    return None
+
+
+def gpu_busy(llm):
+    """Why the GPU is too busy for the model right now (a game holding VRAM, or heavy use), else None.
+    The model needs ~4 GB of the 6 GB; squeezing in next to a game would make both stutter."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5)
+        used, util = (float(x) for x in out.stdout.strip().splitlines()[0].split(","))
+        ours = sum((m.size_vram or 0) for m in ollama.ps().models) / 2**20  # our model, if it's still loaded
+    except Exception:  # noqa: BLE001 - no nvidia-smi, or can't tell: don't hold mail back
+        return None
+    others = used - ours
+    if others >= llm.get("gpu_busy_vram_mb", 1500):
+        return f"other programs are using {others / 1024:.1f} GB of GPU memory"
+    if not ours and util >= llm.get("gpu_busy_percent", 60):
+        return f"the GPU is {util:.0f}% busy"
     return None
 
 
@@ -87,11 +111,13 @@ def chat_json(llm, system, user, state=None):
         lost = gpu_lost_since(state)
         if lost and datetime.now(timezone.utc) - lost < GPU_RETRY_AFTER:
             raise LLMUnavailable(f"GPU unavailable since {lost.astimezone():%H:%M}; waiting before trying again")
+    if llm.get("defer_when_gpu_busy", True) and (why := gpu_busy(llm)):
+        raise LLMDeferred(f"{why} (a game?); trying again later")
     # gemma2:9b spills ~2 GB into system RAM; with the browser open and swap full the kernel
     # OOM-killed Ollama (26 Sep). Better to postpone than to trigger that.
     min_ram = llm.get("min_free_ram_gb", 3)
     if (free := available_ram_gb()) < min_ram:
-        raise LLMUnavailable(f"only {free:.1f} GB RAM available (need {min_ram})")
+        raise LLMDeferred(f"only {free:.1f} GB RAM available (need {min_ram})")
     try:
         if require_gpu and (share := _gpu_share(llm["model"])) is not None and share < MIN_GPU_SHARE:
             _gpu_lost(llm, state, share)  # already loaded on the CPU: don't run an inference to find out
