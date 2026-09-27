@@ -25,6 +25,7 @@ from googleapiclient.discovery import build
 
 import alerts
 import calwatch
+import changes
 import deadlines
 import google_writer
 import habits
@@ -64,7 +65,7 @@ LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "
           "deadlines": "/deadlines", "habits": "/habits", "settings": "/settings", "pause": "/pause", "resume": "/resume"}
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
-SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo",
+SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo", "mv", "cx",
                 "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp"}
 DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
 SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
@@ -229,7 +230,9 @@ class Listener:
             self.effort(row, cq, tap, arg)
             return
         handler = {"add": self.add, "skip": self.skip, "block": self.block, "keep": self.keep,
-                   "addundo": self.undo_add}.get(action)
+                   "addundo": self.undo_add,
+                   "mv": lambda r, c, t: changes.handle(self, r, "mv", now),
+                   "cx": lambda r, c, t: changes.handle(self, r, "cx", now)}.get(action)
         if handler is None:
             tap.answer("Unknown button")
             return
@@ -571,6 +574,10 @@ class Listener:
             tap.answer(f"Already {row['status']}")
             return
         self.state.set_pending_status(row["id"], "skipped")
+        if row["item"].get("replaces") or row["item"].get("cancels"):  # a Changed? / Cancelled? card
+            self.tg.edit(row["tg_message_id"], f"{row['item']['title']}: left as it was.")
+            tap.answer("OK")
+            return
         self.tg.edit(row["tg_message_id"], self._card(row) + "\n\nSkipped")
         tap.answer("Skipped")
         log.info("skipped %r", row["item"]["title"])

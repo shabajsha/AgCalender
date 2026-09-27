@@ -221,3 +221,19 @@ def move_event(calendar, calendar_id, event_id, start, end, tz_name):
     calendar.events().patch(calendarId=calendar_id, eventId=event_id, body={
         "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
         "end": {"dateTime": end.isoformat(), "timeZone": tz_name}}).execute()
+
+
+def find_by_uid(calendar, calendar_id, uid):
+    """The College event made from the .ics invite with this UID, or None."""
+    resp = calendar.events().list(calendarId=calendar_id, privateExtendedProperty=f"ics_uid={uid[:900]}",
+                                  maxResults=10).execute()
+    for ev in resp.get("items", []):
+        if ev.get("status") != "cancelled" and ev.get("extendedProperties", {}).get("private", {}).get("ics_uid") == uid[:900]:
+            return ev
+    return None
+
+
+def move_item_event(calendar, calendar_id, event_id, item, tz_name):
+    """Moves an event made from an email to the item's (new) start/end."""
+    calendar.events().patch(calendarId=calendar_id, eventId=event_id, body={
+        "start": _when(item["start"], item["all_day"], tz_name), "end": _when(item["end"], item["all_day"], tz_name)}).execute()

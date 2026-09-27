@@ -630,6 +630,24 @@ class State:
         """True if this item already came in by email (card sent or added)."""
         return self.item_exists(dedupe_key) or self.pending_exists(dedupe_key)
 
+    def upcoming_items(self, now, days=90):
+        """Created items (from email) starting from yesterday up to `days` ahead: [{dedupe_key, kind, event_id, ...}]."""
+        out = []
+        for r in self.db.execute("SELECT * FROM created_items WHERE event_id IS NOT NULL"):
+            try:
+                start = datetime.fromisoformat(r["start"])
+            except (TypeError, ValueError):
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=now.tzinfo)
+            if now - timedelta(days=1) <= start <= now + timedelta(days=days):
+                out.append({**dict(r), "when": start})
+        return out
+
+    def item_by_event(self, event_id):
+        row = self.db.execute("SELECT * FROM created_items WHERE event_id = ?", (event_id,)).fetchone()
+        return dict(row) if row else None
+
     def delete_item_by_event(self, event_id):
         """Forget a created item (used when a deadline is undone), so it could be added again later."""
         self.db.execute("DELETE FROM created_items WHERE event_id = ?", (event_id,))

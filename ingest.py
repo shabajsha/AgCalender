@@ -20,13 +20,14 @@ from googleapiclient.discovery import build
 import alerts
 import approvals
 import calwatch
+import changes
 import google_writer
 import logsetup
 from auth import get_credentials
 from config import load_config
 from extractor import LLMUnavailable, UnreadableAnswer, extract_items, matches_keywords
 from gmail_reader import fetch_messages, fetch_one, fingerprint, sender_address
-from ics_import import is_past, parse_ics
+from ics_import import cancelled_uids, is_past, parse_ics
 from state import State, dedupe_key
 from telegram_bot import Telegram, TelegramError
 
@@ -130,6 +131,43 @@ def read_one(cfg, state, gmail, tg, msg_id, now):
     log.info("read anyway: %r -> %d item(s), %d asked", msg["subject"], len(items), asked)
 
 
+def changes_in(cfg, state, calendar, tg, msg, sender, items, now):
+    """Moves and cancellations of things you already have become "Changed?" / "Cancelled?" cards (changes.py)
+    instead of new items. Returns (the items still to ask about as new, cards sent)."""
+    text, college, asked, rest = msg["subject"] + "\n" + msg["body"], cfg["calendars"]["college"], 0, []
+    cancelling = bool(changes.CANCEL_RE.search(text))
+    for raw in msg["ics"]:  # an invite that cancels an event made from an earlier invite
+        for uid in cancelled_uids(raw):
+            ev = google_writer.find_by_uid(calendar, college, uid)
+            if ev and changes.ask_cancel(tg, state, changes.event_as_old(state, ev, now.tzinfo), msg, sender):
+                asked += 1
+    for item in items:
+        old = None
+        if item.get("uid"):  # an updated invite: same UID, maybe a new time
+            ev = google_writer.find_by_uid(calendar, college, item["uid"])
+            if ev:
+                old = changes.event_as_old(state, ev, now.tzinfo)
+                if abs((old["when"] - (item["due"] or item["start"])).total_seconds()) < 60:
+                    continue  # the same event again
+        if cancelling:
+            target = old or changes.same_or_similar(state, item, now)
+            if target:
+                asked += changes.ask_cancel(tg, state, target, msg, sender)
+                continue
+        old = old or changes.similar(state, item, now)
+        key = dedupe_key(item)
+        if old and not (state.item_exists(key) or state.pending_exists(key)):
+            changes.ask_change(tg, state, key, item, msg, sender, old)
+            log.info("asked whether %r moved: %s", item["title"], describe(item))
+            asked += 1
+            continue
+        rest.append(item)
+    if cancelling and not items:  # "tomorrow's SDET quiz is cancelled" with nothing for the model to extract
+        for old in changes.mentioned(state, text, now)[:3]:
+            asked += changes.ask_cancel(tg, state, old, msg, sender)
+    return rest, asked
+
+
 def check_mail_flow(state, seen, now, backfill):
     """IIITH mail arrives most days. None for NO_MAIL_ALERT means the Outlook -> Gmail forwarding (or the
     Gmail label) probably stopped, which nothing else would notice."""
@@ -225,6 +263,9 @@ def main():
             items, outcome = items_for(msg, cfg, now)
             if outcome == "no-keyword":
                 stats["no-keyword"] += 1
+            if ask_first and not args.dry_run:
+                items, asked = changes_in(cfg, state, calendar, tg, msg, sender, items, now)
+                stats["asked"] += asked
             for item in items:
                 key = dedupe_key(item)
                 if state.item_exists(key) or state.pending_exists(key):

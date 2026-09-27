@@ -112,3 +112,14 @@ def is_past(item, now):
     if isinstance(end, datetime):
         return end < now
     return end <= now.date() if isinstance(end, date) else False
+
+
+def cancelled_uids(raw):
+    """UIDs an invite cancels (METHOD:CANCEL, or events marked CANCELLED), so the event made from it can be removed."""
+    try:
+        cal = Calendar.from_ical(raw)
+    except ValueError:
+        return []
+    cancel_all = str(cal.get("method", "")).upper() == "CANCEL"
+    return [str(ev.get("uid")) for ev in cal.walk("VEVENT")
+            if ev.get("uid") and (cancel_all or str(ev.get("status", "")).upper() == "CANCELLED")]
