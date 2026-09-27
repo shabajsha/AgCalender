@@ -138,3 +138,82 @@ def _remove_future_work(cfg, state, cal, key, now):
         if item["work_key"] == key:
             state.plan_item_set(item["id"], status="booked", minutes=0)
     return removed
+
+
+def _get(cal, calendar_id, event_id):
+    try:
+        return cal.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    except HttpError as e:
+        if e.resp.status in (404, 410):
+            return None
+        raise
+
+
+def sync_blocks(cfg, state, cal, now, days=3):
+    """Brings the bot's record of its blocks in line with Google Calendar, so a block you moved or deleted in the
+    Calendar app (or on calendar.google.com) is followed: heads-up, "Did you finish?", /today, typed changes and the
+    web page all use the time it has now. Agent blocks the bot didn't track yet are picked up. Returns change notes."""
+    tz = now.tzinfo
+    window_start = slots.at(now.date(), "00:00", tz)
+    window_end = window_start + timedelta(days=days)
+    calendars = [cfg["calendars"]["planner"], cfg["calendars"]["habits"]]
+    live = {}
+    for cid in calendars:
+        for ev in google_writer.list_blocks(cal, cid, window_start, window_end):
+            live[ev["id"]] = (cid, ev)
+    notes = []
+    for b in state.blocks(statuses=["booked", "asked", "busy", "notdone", "partly"]):
+        found = live.pop(b["event_id"], None)
+        ev = found[1] if found else None
+        answered = b["status"] in ("notdone", "partly")  # you said it didn't happen (fully)...
+        if ev is None:
+            if datetime.fromisoformat(b["start"]) < window_start - timedelta(days=1):
+                continue  # long past: history, not worth a Google call
+            ev = _get(cal, b.get("calendar") or calendars[0], b["event_id"])  # moved out of the window, or deleted
+        if ev is None or ev.get("status") == "cancelled":
+            if not answered:
+                state.block_set(b["id"], status="cleared")
+                notes.append(f"{b['title']}: deleted in Google Calendar")
+            continue
+        start, end = planner._local(ev["start"], tz), planner._local(ev["end"], tz)
+        if start is None:
+            continue
+        if answered:
+            if start > now and start != datetime.fromisoformat(b["start"]):  # ...then moved it to a later time
+                state.block_set(b["id"], start=start.isoformat(), end=end.isoformat(), status="booked", headsup=0)
+                notes.append(f"{b['title']}: rescheduled by you to {start:%a %H:%M}-{end:%H:%M}")
+            continue
+        fields = {}
+        title = (ev.get("summary") or b["title"]).removeprefix("Work: ")
+        if title != b["title"]:
+            fields["title"] = title
+        if start != datetime.fromisoformat(b["start"]) or end != datetime.fromisoformat(b["end"]):
+            fields.update(start=start.isoformat(), end=end.isoformat())
+            if start > now:
+                fields["headsup"] = 0
+            if b["status"] == "asked" and end > now:
+                fields["status"] = "booked"  # moved to later: ask again when it really ends
+            notes.append(f"{title}: moved to {start:%a %H:%M}-{end:%H:%M}")
+        if fields:
+            state.block_set(b["id"], **fields)
+    for event_id, (cid, ev) in live.items():  # agent blocks the bot didn't know (e.g. from an older version)
+        if state.block_by_event(event_id):
+            continue
+        start, end = planner._local(ev["start"], tz), planner._local(ev["end"], tz)
+        if start is None or end < now - timedelta(hours=12):
+            continue
+        private = ev.get("extendedProperties", {}).get("private", {})
+        block_id = state.block_add(None, event_id, private.get("work_key"), (ev.get("summary") or "").removeprefix("Work: "),
+                                   start, end, calendar=cid)
+        if private.get("kind") == "busy":
+            state.block_set(block_id, status="busy")
+    state.set_meta("blocks_synced_at", now.isoformat())
+    return notes
+
+
+def sync_if_stale(cfg, state, cal, now, max_age=timedelta(minutes=1)):
+    """sync_blocks unless it ran very recently (several callers may ask within one tap)."""
+    last = state.get_meta("blocks_synced_at")
+    if last and now - datetime.fromisoformat(last) < max_age:
+        return []
+    return sync_blocks(cfg, state, cal, now)

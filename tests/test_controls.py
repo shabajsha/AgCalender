@@ -105,6 +105,7 @@ def booked(db, monkeypatch):
     monkeypatch.setattr(google_writer, "move_event", lambda cal, cid, eid, s, e, tz: moved.append((eid, s, e)))
     monkeypatch.setattr(google_writer, "delete_event", lambda cal, cid, eid: deleted.append(eid))
     monkeypatch.setattr(slotpicker.planner, "work_context", lambda *a, **k: ([], [], 360))
+    monkeypatch.setattr(actions, "sync_if_stale", lambda *a, **k: [])       # sync has its own tests
     bid = db.block_add(None, "ev1", "task:a", "Study SDET", NOW + timedelta(minutes=4), NOW + timedelta(minutes=94))
     return SimpleNamespace(lis=lis, moved=moved, deleted=deleted, bid=bid)
 

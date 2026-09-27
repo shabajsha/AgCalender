@@ -274,6 +274,11 @@ Study SDET MidSem
   the days left. Change one with `/exams` or the buttons on its card. The morning message lists exams coming up.
 - `/todo` after the morning sends free slots for the new to-do straight away.
 - The daily limit (`max_work_hours_per_day`) is a warning, never a silent drop.
+- **Moving or deleting a block in the Google Calendar app is followed.** The bot re-reads its blocks every 5 minutes
+  (and right before a heads-up, a "Did you finish?", `/today`, a typed change or the web page), so it uses the time a
+  block has now. A deleted block gets no more questions; a block you answered *Not done* and then moved to a later
+  time counts as booked again.
+- Ask "what's scheduled today?" (or tomorrow, or a weekday) for that day's events and blocks.
 
 ## Typing changes, habits, deadlines, settings
 

@@ -322,6 +322,11 @@ def tick(cfg, state, now, tg, services):
     """`services()` returns (calendar, tasks); only called when Google is needed (reminders)."""
     if _asleep(cfg, now):
         return  # after sleep, whatever is due arrives at once
+    ended = [b for b in state.blocks(statuses=["booked"]) if datetime.fromisoformat(b["end"]) <= now]
+    if ended:  # moved or deleted in the Calendar app since it was booked? Ask about the time it really has
+        import actions
+        cal, _ = services()
+        actions.sync_if_stale(cfg, state, cal, now)
     for b in state.blocks(statuses=["booked"]):
         if datetime.fromisoformat(b["end"]) <= now:
             start, end = datetime.fromisoformat(b["start"]).astimezone(now.tzinfo), datetime.fromisoformat(b["end"]).astimezone(now.tzinfo)
@@ -431,9 +436,14 @@ def _set_prep(listener, message_id, rest, now):
 
 def heads_up(listener, now):
     """ "Next at 15:00: Study SDET MidSem (1 h 30 min)" with Start / Push 30 min / Skip, heads_up_minutes before."""
+    import actions
     lead = listener.cfg["morning"].get("heads_up_minutes", 5)
     if not lead or _asleep(listener.cfg, now):
         return
+    soon = [b for b in listener.state.blocks(statuses=["booked"]) if not b["headsup"]
+            and now < datetime.fromisoformat(b["start"]) <= now + timedelta(minutes=lead + 15)]
+    if soon:  # you may have moved it in the Calendar app: use the time it has now
+        actions.sync_if_stale(listener.cfg, listener.state, listener.calendar, now)
     for b in listener.state.blocks(statuses=["booked"]):
         start = datetime.fromisoformat(b["start"]).astimezone(now.tzinfo)
         if b["headsup"] or not now < start <= now + timedelta(minutes=lead):
@@ -505,17 +515,23 @@ STATUS_TEXT = {"booked": "", "asked": " - how did it go? (question above)", "don
                "notdone": " - not done", "busy": " - busy"}
 
 
-def today_message(cfg, state, cal, now):
+def today_message(cfg, state, cal, now, day=None):
+    """What's scheduled on `day` (default today): events, your blocks (as they are in Google Calendar now, also if
+    you moved them in the Calendar app), and today's tasks still without a time."""
+    import actions
     import digest
     today = now.date()
-    lines = [f"Today - {now:%a %d %b}", "", "Events"] + digest.events_today(cfg, cal, state, now)
-    blocks = [b for b in state.blocks() if datetime.fromisoformat(b["start"]).astimezone(now.tzinfo).date() == today
-              and b["status"] != "cleared"]
+    day = day or today
+    actions.sync_if_stale(cfg, state, cal, now)
+    head = "Today" if day == today else "Tomorrow" if day == today + timedelta(days=1) else f"{day:%A}"
+    lines = [f"{head} - {day:%a %d %b}", "", "Events"] + digest.events_today(cfg, cal, state, now, day=day)
+    blocks = sorted((b for b in state.blocks() if datetime.fromisoformat(b["start"]).astimezone(now.tzinfo).date() == day
+                     and b["status"] != "cleared"), key=lambda b: b["start"])
     lines += ["", "Your blocks"] + ([f"- {datetime.fromisoformat(b['start']).astimezone(now.tzinfo):%H:%M}-"
                                     f"{datetime.fromisoformat(b['end']).astimezone(now.tzinfo):%H:%M}  {b['title']}"
                                     f"{STATUS_TEXT.get(b['status'], '')}" for b in blocks] or ["- None booked yet"])
-    waiting = [r for r in state.plan_items(today, statuses=["open"]) if r["minutes"] > 0]
+    waiting = [r for r in state.plan_items(today, statuses=["open"]) if r["minutes"] > 0] if day == today else []
     if waiting:
         lines += ["", "No time picked yet"] + [f"- {r['title']}: {fmt(r['minutes'])}" for r in waiting]
-    buttons = [[("Plan rest of today", "tdp:"), ("Clear today's plan", f"clear:{today.isoformat()}")]]
+    buttons = [[("Plan rest of today", "tdp:"), ("Clear today's plan", f"clear:{today.isoformat()}")]] if day == today else None
     return "\n".join(lines), buttons

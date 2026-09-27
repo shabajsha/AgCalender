@@ -20,6 +20,11 @@ CFG = {"timezone": "Asia/Kolkata", "calendars": {"college": "COL", "planner": "P
 IDS = itertools.count(1)
 
 
+def slotpicker_actions():
+    import actions
+    return actions
+
+
 def T(h, m=0):
     return NOW.replace(hour=h, minute=m)
 
@@ -44,6 +49,7 @@ def day(db, monkeypatch):
         return free, items, 360 - sum((e - s).total_seconds() / 60 for s, e, _ in booked)
 
     monkeypatch.setattr(planner, "work_context", context)
+    monkeypatch.setattr(slotpicker_actions(), "sync_if_stale", lambda *a, **k: [])   # sync has its own tests
     monkeypatch.setattr(google_writer, "create_block", lambda cal, cid, title, s, e, tz, kind, work_key=None, note=None:
                         booked.append((s, e, work_key)) or f"ev{len(booked)}")
     listener = SimpleNamespace(cfg=CFG, state=db, tg=tg, tasks=tasks, calendar=None)

@@ -56,11 +56,11 @@ def _due_datetime(event, tz):
     return datetime.combine(start, time(23, 59), tz) if all_day else end
 
 
-def events_today(cfg, cal, state, now, skip_planner_blocks=True):
-    """Today's events across every calendar you have switched on. Tracked events appear through their College copy;
-    events still waiting for Track/Ignore are marked; ignored ones and ignored calendars are left out."""
+def events_today(cfg, cal, state, now, skip_planner_blocks=True, day=None):
+    """The day's events (default today) across every calendar you have switched on. Tracked events appear through
+    their College copy; events still waiting for Track/Ignore are marked; ignored ones and calendars are left out."""
     tz = now.tzinfo
-    day_start = datetime.combine(now.date(), time(), tz)
+    day_start = datetime.combine(day or now.date(), time(), tz)
     lines, statuses = [], state.watch_statuses()
     for c in calwatch.load_calendars(cal, cfg, state):
         if not c["selected"] or c["policy"] == "ignore":

@@ -67,6 +67,12 @@ The repo is under git (local only). Commit at the end of each phase with the Co-
   `deadlines`, `nlcommands`) and the web page, so the same checks apply: `free_on(day)` (= `planner.free_today` with a
   synthetic now) and `fits`; a clash returns `nearest_free` alternatives. Blocks keep their calendar in
   `booked_blocks.calendar` (habits calendar for habits). Busy time is a planner-calendar block with kind `busy`.
+- **Following the Calendar app (`actions.sync_blocks`):** the Google Calendar events are the truth for the agent's
+  blocks; `booked_blocks` is only its record. `sync_blocks` (listener every 5 min; `sync_if_stale` before heads-up,
+  done-checks, `/today`, typed changes and the web page) lists planner/habits blocks for today..+3 days, fetches rows
+  missing from the window by id, updates moved times (re-arming heads-up; `asked` -> `booked` if moved later), clears
+  deleted ones, re-books `notdone`/`partly` rows you moved to a later time, and adopts tagged blocks it didn't track.
+  Tests that aren't about syncing stub `actions.sync_if_stale`.
 - **Typed changes (`nlcommands.py`):** `parse_rules` (ordered regexes) then `parse_llm` (JSON intent with copied time
   words, guarded by `llm.chat_json`); `find` fuzzy-matches the task among `targets` (booked blocks, today's items,
   deadlines/exams, habits); `propose` returns a question + proposal stored in `meta nl:<n>`; `nl:y|n|t` taps apply it

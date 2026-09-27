@@ -29,6 +29,7 @@ def web(db, monkeypatch):
     monkeypatch.setattr(slotpicker, "prepare", lambda cfg, state, now, cal, tasks, rank=True: ([], [(now, now + timedelta(hours=6))], 360))
     monkeypatch.setattr(google_writer, "move_event", lambda cal, cid, eid, s, e, tz: moved.append((eid, s, e)))
     monkeypatch.setattr(actions, "free_on", lambda cfg, state, cal, day, now, ignore_ids=frozenset(): free[0])
+    monkeypatch.setattr(actions, "sync_if_stale", lambda *a, **k: [])       # sync has its own tests
     now = datetime.now(TZ).replace(second=0, microsecond=0)
     free = [[(now, now + timedelta(hours=8))]]
     app = webapp.create_app(services=lambda: (FakeCalendar([]), FakeTasks()), state_factory=lambda: db, config=lambda: CFG)

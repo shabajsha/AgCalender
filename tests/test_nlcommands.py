@@ -51,6 +51,7 @@ def plan(db, monkeypatch):
     monkeypatch.setattr(google_writer, "create_block", lambda cal, cid, title, s, e, tz, kind, work_key=None, note=None:
                         created.append((cid, title, s, e, kind)) or f"new{len(created)}")
     monkeypatch.setattr(google_writer, "delete_event", lambda cal, cid, eid: deleted.append(eid))
+    monkeypatch.setattr(actions, "sync_if_stale", lambda *a, **k: [])       # sync has its own tests
     b1 = db.block_add(None, "ev1", "task:a", "Study SDET MidSem", at(2026, 9, 28, 11), at(2026, 9, 28, 12, 30))
     b2 = db.block_add(None, "ev2", "task:b", "Study SMAI last Lecture", at(2026, 9, 28, 17), at(2026, 9, 28, 18, 30))
     item = db.plan_item_upsert(NOW.date(), "task:c", "Do LeetCode Daily", "task", at(2026, 9, 28, 23, 59).isoformat(), "DAILY", 30)

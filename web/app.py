@@ -276,6 +276,7 @@ def events_on(c, day):
 
 def page_state(c, day):
     tz, today = c.tz, c.now.date()
+    actions.sync_if_stale(c.cfg, c.state, c.cal, c.now)  # blocks you moved in the Calendar app show where they are now
     blocks = [{"id": b["id"], "title": b["title"], "start": _iso(datetime.fromisoformat(b["start"]), tz),
                "end": _iso(datetime.fromisoformat(b["end"]), tz), "status": b["status"],
                "kind": "habit" if (b["work_key"] or "").startswith("habit:") else "busy" if b["status"] == "busy" else "work"}

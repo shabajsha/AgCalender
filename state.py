@@ -480,7 +480,7 @@ class State:
 
     PLAN_ITEM_FIELDS = {"title", "due", "list_id", "minutes", "tg_message_id", "status", "reminded", "kind", "sent_at",
                         "window_start"}
-    BLOCK_FIELDS = {"status", "tg_message_id", "event_id", "headsup", "start", "end", "calendar"}
+    BLOCK_FIELDS = {"status", "tg_message_id", "event_id", "headsup", "start", "end", "calendar", "title"}
 
     def plan_item_upsert(self, day, work_key, title, kind, due, list_id, minutes):
         """Today's row for a task: created open, or its title/due/minutes refreshed. Returns the row."""

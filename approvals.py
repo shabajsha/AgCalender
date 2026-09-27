@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 
+import actions
 import alerts
 import calwatch
 import changes
@@ -75,6 +76,7 @@ UNDO_ADD_WINDOW = timedelta(minutes=10)
 # slotpicker.py: times, "Did you finish?", evening check, exams, heads-up, moving a block
 SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb")
 HEADS_UP_EVERY_S = 60
+SYNC_BLOCKS_EVERY_S = 300  # re-read your blocks from Google Calendar (you may move them in the Calendar app)
 # Typed instead of tapping the check-in buttons (a whole message, after lowercasing and trimming punctuation).
 DONE_WORDS = {"done", "finished", "that's all", "thats all", "that's it", "thats it", "all done", "ok", "okay"}
 NONE_WORDS = {"nothing", "nothing today", "no", "none", "nope", "no tasks", "nil"}
@@ -641,7 +643,7 @@ def main():
     except TelegramError as e:
         log.warning("could not register bot commands: %s", e)
     log.info("listening for taps and commands: %s (Ctrl+C to stop)", " ".join("/" + c for c, _ in COMMANDS))
-    offset, last_expire, offline_since, last_heads_up = None, 0.0, None, 0.0
+    offset, last_expire, offline_since, last_heads_up, last_sync = None, 0.0, None, 0.0, 0.0
     while True:
         try:
             updates = listener.tg.updates(offset)
@@ -670,6 +672,14 @@ def main():
             except Exception as e:
                 log.exception("failed to handle an update")
                 listener.report_error(e)
+        if time.time() - last_sync > SYNC_BLOCKS_EVERY_S:
+            try:
+                for note in actions.sync_blocks(listener.cfg, listener.state, listener.calendar, datetime.now(listener._tz())):
+                    log.info("calendar change: %s", note)
+            except Exception as e:
+                if not alerts.is_offline_error(e):
+                    log.exception("block sync failed")
+            last_sync = time.time()
         if time.time() - last_heads_up > HEADS_UP_EVERY_S:
             try:
                 slotpicker.heads_up(listener, datetime.now(listener._tz()))
