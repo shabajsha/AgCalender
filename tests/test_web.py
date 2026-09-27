@@ -53,9 +53,10 @@ def test_page_has_the_csrf_token_and_strict_headers(web):
 
 @pytest.mark.parametrize("headers, status", [
     ({"Host": "evil.example"}, 403),                                    # DNS rebinding
-    ({"Host": "laptop.tail1234.ts.net"}, 200),                          # your Tailscale name
-    ({"Host": "localhost:8765", "Tailscale-User-Login": "someone@else.com"}, 403),
-    ({"Host": "localhost:8765", "Tailscale-User-Login": "me@example.com"}, 200),
+    ({"Host": "localhost:8765"}, 200),                                  # on the laptop
+    ({"Host": "laptop.tail1234.ts.net", "Tailscale-User-Login": "me@example.com"}, 200),   # you, via Tailscale
+    ({"Host": "laptop.tail1234.ts.net", "Tailscale-User-Login": "someone@else.com"}, 403),
+    ({"Host": "laptop.tail1234.ts.net"}, 403),                          # a tagged device: no login at all
 ])
 def test_who_may_open_it(web, headers, status):
     assert web.client.get("/", headers=headers).status_code == status
@@ -70,7 +71,8 @@ def test_changes_need_the_token_and_the_same_origin(web):
 
 
 def test_state_lists_blocks_and_settings(web):
-    r = web.client.get("/api/state", headers={"Host": "localhost:8765"})
+    assert web.client.get("/api/state", headers={"Host": "localhost:8765"}).status_code == 403   # no token: refused
+    r = web.client.get("/api/state", headers={"Host": "localhost:8765", "X-CSRF-Token": web.csrf})
     data = r.get_json()
     assert r.status_code == 200 and data["blocks"][0]["title"] == "Study SDET" and data["blocks"][0]["kind"] == "work"
     assert any(s["label"] == "Daily work limit (h)" for s in data["settings"])

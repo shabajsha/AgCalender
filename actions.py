@@ -45,8 +45,14 @@ def nearest_free(free, minutes, around, count=3):
     return sorted((t, t + need) for t in picked)
 
 
+OPEN = ("booked", "asked")  # blocks that haven't been answered or removed
+
+
 def move_block(cfg, state, cal, block, start, end, now):
     """Moves a booked block (by its booked_blocks row). Returns (ok, message, alternatives)."""
+    block = state.block(block["id"]) or block
+    if block["status"] not in OPEN:
+        return False, f"{block['title']} was already {_answered(block)}, so it wasn't moved.", []
     if start < now - timedelta(minutes=5):
         return False, "That time has already passed.", []
     free = free_on(cfg, state, cal, start.date(), now, ignore_ids={block["event_id"]})
@@ -58,10 +64,21 @@ def move_block(cfg, state, cal, block, start, end, now):
     return True, f"Moved {block['title']} to {start:%a %H:%M}-{end:%H:%M}.", []
 
 
+def _answered(block):
+    return {"done": "marked done", "partly": "marked partly done", "notdone": "marked not done",
+            "cleared": "removed", "busy": "busy time"}.get(block["status"], block["status"])
+
+
 def skip_block(cfg, state, cal, block):
-    """You won't do this block: it's removed from the calendar and counts as not done (so it's planned again)."""
+    """You won't do this block: it's removed from the calendar and counts as not done (so it's planned again).
+    Returns False (and changes nothing) if it was already answered or removed - an old button mustn't delete the
+    record of work you did."""
+    block = state.block(block["id"]) or block
+    if block["status"] not in OPEN:
+        return False
     google_writer.delete_event(cal, _cal_of(cfg, block), block["event_id"])
     state.block_set(block["id"], status="notdone")
+    return True
 
 
 def book(cfg, state, cal, item, start, end, now):
@@ -199,6 +216,9 @@ def sync_blocks(cfg, state, cal, now, days=3):
     for event_id, (cid, ev) in live.items():  # agent blocks the bot didn't know (e.g. from an older version)
         if state.block_by_event(event_id):
             continue
+        created = ev.get("created")
+        if created and now - datetime.fromisoformat(created.replace("Z", "+00:00")) < timedelta(minutes=2):
+            continue  # just made (by a tap or the web page), and being recorded by that process right now
         start, end = planner._local(ev["start"], tz), planner._local(ev["end"], tz)
         if start is None or end < now - timedelta(hours=12):
             continue

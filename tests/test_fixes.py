@@ -260,7 +260,7 @@ def test_clear_keeps_started_blocks_and_refuses_past_days(monkeypatch):
     monkeypatch.setattr(planner, "build", lambda *a, **k: None)
     monkeypatch.setattr(google_writer, "list_blocks", lambda cal, cid, s, e: blocks if cid == "PLAN" else [])
     monkeypatch.setattr(google_writer, "delete_event", lambda cal, cid, eid: deleted.append(eid))
-    assert planner.clear_day(PLAN_CFG, now.date(), now) == 1 and deleted == ["later"]
+    assert planner.clear_day(PLAN_CFG, now.date(), now) == ["later"] and deleted == ["later"]
     assert planner.clear_day(PLAN_CFG, now.date() - timedelta(days=1), now) is None
 
 

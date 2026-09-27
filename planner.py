@@ -212,7 +212,7 @@ def _plan_today(cfg, state, now, dry_run, how):
         (habit_blocks.append((h["name"], block)) if block else missed_habits.append(h["name"]))
 
     # 4. Work: how much each item needs today, ranked, then placed earliest-first inside the work window.
-    done_by_key, _, worked_today, _ = block_minutes(cal, cfg, state, now, ignore_ids=removed)
+    done_by_key, _, worked_today, _, _ = block_minutes(cal, cfg, state, now, ignore_ids=removed)
     items = needed_today(cal, tasks_api, cfg, state, now, done_by_key)
     ranked, used_llm = ranker.rank(items, cfg["ollama"], today)
 
@@ -262,13 +262,13 @@ def free_today(cal, cfg, state, now, ignore_ids=frozenset()):
 
 
 def block_minutes(cal, cfg, state, now, ignore_ids=frozenset()):
-    """(done_by_key, booked_today_by_key, worked_today, booked_today): minutes from planner blocks.
-    Started blocks count as done, weighted by your answer to "Did you finish?" (done 100%, partly 50%,
+    """(done_by_key, booked_today_by_key, worked_today, booked_today, done_today_by_key): minutes from planner
+    blocks. Started blocks count as done, weighted by your answer to "Did you finish?" (done 100%, partly 50%,
     not done 0; not answered yet 100%). Blocks later today that you booked count as booked."""
     tz, today = now.tzinfo, now.date()
     day_end = slots.at(today + timedelta(days=1), "00:00", tz)
     answers = state.block_answers()
-    done, booked, worked, booked_total = {}, {}, 0.0, 0.0
+    done, booked, worked, booked_total, done_today = {}, {}, 0.0, 0.0, {}
     for b in google_writer.list_blocks(cal, cfg["calendars"]["planner"], now - timedelta(days=60), day_end):
         key = b.get("extendedProperties", {}).get("private", {}).get("work_key")
         s, e = _local(b["start"], tz), _local(b["end"], tz)
@@ -280,10 +280,11 @@ def block_minutes(cal, cfg, state, now, ignore_ids=frozenset()):
             done[key] = done.get(key, 0) + got
             if s.date() == today:
                 worked += got
+                done_today[key] = done_today.get(key, 0) + got
         elif s.date() == today:
             booked[key] = booked.get(key, 0) + minutes
             booked_total += minutes
-    return done, booked, worked, booked_total
+    return done, booked, worked, booked_total, done_today
 
 
 def needed_today(cal, tasks_api, cfg, state, now, done_by_key):
@@ -311,11 +312,14 @@ def work_context(cfg, state, now, cal, tasks_api, rank=False):
     Each item's `need` = today's share minus what's already booked today. Habits come first."""
     import habits
     pc, today = cfg["planner"], now.date()
-    done, booked, worked, booked_total = block_minutes(cal, cfg, state, now)
+    done, booked, worked, booked_total, done_today = block_minutes(cal, cfg, state, now)
     free = free_today(cal, cfg, state, now)
-    items = needed_today(cal, tasks_api, cfg, state, now, done)
+    # Today's share is worked out as of this morning (work done before today), then everything done or booked today
+    # is taken off it - so a task you booked stays booked while its block runs, instead of asking for time again.
+    before_today = {k: v - done_today.get(k, 0) for k, v in done.items()}
+    items = needed_today(cal, tasks_api, cfg, state, now, before_today)
     for it in items:
-        it["need"] = max(0, round(it["today_min"] - booked.get(it["key"], 0)))
+        it["need"] = max(0, round(it["today_min"] - done_today.get(it["key"], 0) - booked.get(it["key"], 0)))
     if rank:
         items, _ = ranker.rank(items, cfg["ollama"], today)
     items = habits.today_items(cfg, state, now, lambda key: habits.minutes_on(state, key, today)) + items
@@ -344,22 +348,23 @@ def summarize(now, habit_blocks, missed_habits, work_blocks, short, used_llm, ra
 
 
 def clear_day(cfg, day, now):
-    """Removes the day's planned blocks that haven't started. Blocks already begun or done stay: they are the
-    record of work done that later plans count. Returns the number removed, or None for a day that is over."""
+    """Removes the day's planned blocks that haven't started (by their time, so blocks you moved to this day count).
+    Blocks already begun or done stay: they are the record of work done that later plans count. Busy time you
+    blocked out stays too. Returns the ids of the removed events, or None for a day that is over."""
     if day < now.date():
         return None
     tz = ZoneInfo(cfg["timezone"])
     with planning_lock():
         cal = build("calendar", "v3", credentials=get_credentials())
         start, end = slots.at(day, "00:00", tz), slots.at(day + timedelta(days=1), "00:00", tz)
-        removed = 0
+        removed = []
         for cid in (cfg["calendars"]["planner"], cfg["calendars"]["habits"]):
             for b in google_writer.list_blocks(cal, cid, start, end):
                 begins = _local(b["start"], tz)
-                if (b.get("extendedProperties", {}).get("private", {}).get("plan_date") == day.isoformat()
-                        and (begins is None or begins >= now)):
+                kind = b.get("extendedProperties", {}).get("private", {}).get("kind")
+                if begins is not None and begins >= now and begins.date() == day and kind != "busy":
                     google_writer.delete_event(cal, cid, b["id"])
-                    removed += 1
+                    removed.append(b["id"])
     return removed
 
 
@@ -398,15 +403,17 @@ def main():
 
     if args.clear:
         day = args.date or now.date()
-        removed = clear_day(cfg, day, now)
-        if removed is None:
+        removed_ids = clear_day(cfg, day, now)
+        if removed_ids is None:
             deliver(f"Plan for {day:%a %d %b}", "That day is over, so its blocks stay: they're the record of work "
                                                "you did, which later plans count.", channels)
             return
         state.record_plan(day, "cleared")
-        for b in state.blocks(statuses=["booked"]):  # no "Did you finish?" for blocks that are gone
-            if datetime.fromisoformat(b["start"]) >= now and datetime.fromisoformat(b["start"]).date() == day:
-                state.block_set(b["id"], status="cleared")
+        for event_id in removed_ids:  # no heads-up or "Did you finish?" for blocks that are gone
+            row = state.block_by_event(event_id)
+            if row:
+                state.block_set(row["id"], status="cleared")
+        removed = len(removed_ids)
         log.info("cleared %d planner block(s) on %s", removed, day)
         deliver(f"Plan for {day:%a %d %b} cleared", f"Removed {removed} planned block(s) that hadn't started. "
                 "Send /plan to plan again.", channels)

@@ -26,6 +26,7 @@ from llm import LLMTimeout, LLMUnavailable, chat_json
 log = logging.getLogger("nlcommands")
 DUR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b", re.I)
 HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b", re.I)
+PROPOSAL_LIFETIME = timedelta(minutes=30)  # an old Yes button mustn't act on a plan that has changed since
 EXAMPLES = ("move SDET study to 7pm", "leetcode not today", "busy 2-5pm", "make midsem prep 10 hours",
             "add gym at 6pm for 1h", "swap SMAI and SDET A2")
 
@@ -232,6 +233,8 @@ def _fit(cfg, state, cal, now, proposal, start, minutes, question, ignore=frozen
     if actions.fits(free, start, end):
         return question, proposal
     alternatives = actions.nearest_free(free, minutes, start)
+    if not alternatives:
+        return f"{question.rstrip('?')}: {start:%H:%M}-{end:%H:%M} isn't free, and there's no free time near it that day.", None
     proposal["alternatives"] = [s.isoformat() for s, _ in alternatives]
     return (f"{question.rstrip('?')}: {start:%H:%M}-{end:%H:%M} isn't free. Tap one of the nearest free times, or Cancel:",
             proposal)
@@ -273,7 +276,7 @@ def handle_text(listener, text, now):
         return True
     n = int(listener.state.get_meta("nl_seq") or 0) + 1
     listener.state.set_meta("nl_seq", str(n))
-    listener.state.set_meta(f"nl:{n}", json.dumps(proposal))
+    listener.state.set_meta(f"nl:{n}", json.dumps({**proposal, "made": now.isoformat()}))
     listener.tg.send(reply, buttons(n, proposal))
     log.info("proposed %s for %r", proposal["op"], text)
     return True
@@ -291,6 +294,9 @@ def handle(listener, cq, rest, now):
     proposal = json.loads(raw)
     if op == "n":
         listener.tg.edit(message_id, "OK, nothing changed.")
+        return
+    if proposal.get("made") and now - datetime.fromisoformat(proposal["made"]) > PROPOSAL_LIFETIME:
+        listener.tg.edit(message_id, "That was a while ago and your plan may have changed; nothing was done. Send it again.")
         return
     if op == "t" and len(stamp) == 12:
         start = datetime.strptime(stamp, "%Y%m%d%H%M").replace(tzinfo=now.tzinfo)
@@ -312,7 +318,8 @@ def apply(listener, p, now):
         return text
     if p["op"] == "skip":
         block = state.block(p["block"])
-        actions.skip_block(cfg, state, cal, block)
+        if not actions.skip_block(cfg, state, cal, block):
+            return f"{block['title']} was already {actions._answered(block)}; nothing changed."
         return f"Skipped {block['title']}. It'll be suggested again (tap 'Plan rest of today' for new times)."
     if p["op"] == "not_today":
         import slotpicker
@@ -330,6 +337,8 @@ def apply(listener, p, now):
         return text
     if p["op"] == "add":
         mc = cfg["morning"]
+        if not actions.fits(actions.free_on(cfg, state, cal, start.date(), now), start, end):
+            return f"{start:%H:%M}-{end:%H:%M} isn't free any more; nothing was added."  # no to-do left without a time
         batch, added = todos.add(listener.tasks, mc["todo_tasklist"], state, start.date(), [(p["title"], p["minutes"])])
         task_id = state.todo_batch(batch)[0]["task_id"]
         item = state.plan_item_upsert(start.date(), f"task:{task_id}", p["title"], "task",
@@ -342,8 +351,11 @@ def apply(listener, p, now):
         a_len = datetime.fromisoformat(a["end"]) - datetime.fromisoformat(a["start"])
         b_len = datetime.fromisoformat(b["end"]) - datetime.fromisoformat(b["start"])
         a_start, b_start = datetime.fromisoformat(b["start"]), datetime.fromisoformat(a["start"])
+        if a["status"] not in actions.OPEN or b["status"] not in actions.OPEN:
+            return "One of them was already answered or removed; nothing changed."
         free = actions.free_on(cfg, state, cal, a_start.date(), now, ignore_ids={a["event_id"], b["event_id"]})
-        if not (actions.fits(free, a_start, a_start + a_len) and actions.fits(free, b_start, b_start + b_len)):
+        overlap = a_start < b_start + b_len and b_start < a_start + a_len
+        if overlap or not (actions.fits(free, a_start, a_start + a_len) and actions.fits(free, b_start, b_start + b_len)):
             return "They don't fit in each other's times (different lengths). Nothing changed."
         for block, s, length in ((a, a_start, a_len), (b, b_start, b_len)):
             google_writer.move_event(cal, block.get("calendar") or cfg["calendars"]["planner"], block["event_id"], s,

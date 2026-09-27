@@ -73,6 +73,9 @@ DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
 SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
 HABIT_ACTIONS = ("hbn", "hbm", "hbd", "hbw", "hbs", "hbx", "hbp", "hbr", "hby", "hbl")
 UNDO_ADD_WINDOW = timedelta(minutes=10)
+# Taps that belong to a waiting conversation; any other tap (or a command) ends it, so a later message isn't taken as
+# its answer ("busy 2-5pm" typed after abandoning "Type a value" used to become your work hours).
+CONV_ACTIONS = {"habit": ("hbm", "hbd", "hbw", "hbs", "hbx")}
 # slotpicker.py: times, "Did you finish?", evening check, exams, heads-up, moving a block
 SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb")
 HEADS_UP_EVERY_S = 60
@@ -173,6 +176,9 @@ class Listener:
 
     def _route(self, cq, tap):
         action, _, rest = cq.get("data", "").partition(":")
+        conv = self.state.conv(datetime.now(self._tz()))
+        if conv and action not in CONV_ACTIONS.get(conv["flow"], ()):
+            self.state.clear_conv()
         if action in SLOW_ACTIONS:
             tap.answer()  # before the slow Google calls; results show by editing the message
         if action in ("crv", "crva"):  # the daily calendar review and "changed" cards
@@ -259,6 +265,8 @@ class Listener:
         today = now.date()
         typed = re.sub(r"[^\w' ]+", "", text.lower()).strip()
         checkin_open = morning.checkin_open(self.state, today)
+        if text.startswith("/") or LABELS.get(text.lower()):
+            self.state.clear_conv()  # a command: whatever you were typing an answer for is dropped
         conv = self.state.conv(now) if text and not text.startswith("/") and not LABELS.get(text.lower()) else None
         if conv:  # a value you were asked to type (a setting, a habit, a new due date)
             {"setting": settings.typed, "habit": habits.typed, "deadline_date": deadlines.typed}.get(

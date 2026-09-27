@@ -146,7 +146,9 @@ def prepare(cfg, state, now, cal, tasks_api, rank=True):
         if row["status"] == "open" and it["need"] <= 0:
             state.plan_item_set(row["id"], status="booked")
         elif row["status"] == "booked" and it["need"] > 0:
-            state.plan_item_set(row["id"], status="open")  # e.g. a slot came back as Not done
+            # e.g. a slot came back as Not done: it needs a time again, with a fresh "when?" message (and the
+            # reminder counted from that one, not from the morning's)
+            state.plan_item_set(row["id"], status="open", tg_message_id=None, sent_at=None, reminded=0)
     for row in state.plan_items(today, statuses=["open"]):
         if row["work_key"] not in wanted:  # ticked off in Tasks meanwhile, or no longer due
             state.plan_item_set(row["id"], status="booked", minutes=0)
@@ -464,8 +466,8 @@ def _heads_up_answer(listener, message_id, rest, now):
         listener.tg.edit(message_id, f"Started: {block['title']}. I'll ask how it went when it ends.")
         return
     if op == "k":
-        actions.skip_block(listener.cfg, listener.state, listener.calendar, block)
-        _reoffer(listener, message_id, block, now, "Skipped")
+        if actions.skip_block(listener.cfg, listener.state, listener.calendar, block):
+            _reoffer(listener, message_id, block, now, "Skipped")
         return
     start, end = (datetime.fromisoformat(block[k]).astimezone(now.tzinfo) for k in ("start", "end"))
     ok, text, alternatives = actions.move_block(listener.cfg, listener.state, listener.calendar, block,
@@ -484,6 +486,9 @@ def _move_to(listener, message_id, rest, now):
     raw_id, _, stamp = rest.partition(":")
     block = listener.state.block(int(raw_id)) if raw_id.isdigit() else None
     if block is None or len(stamp) != 12:
+        return
+    if block["status"] not in actions.OPEN:
+        listener.tg.edit(message_id, f"{block['title']}: already {actions._answered(block)}, so nothing was moved.")
         return
     start = datetime.strptime(stamp, "%Y%m%d%H%M").replace(tzinfo=now.tzinfo)
     length = datetime.fromisoformat(block["end"]) - datetime.fromisoformat(block["start"])
@@ -506,7 +511,7 @@ def _reoffer(listener, message_id, block, now, label):
     row = state.plan_item(row["id"])
     chunk, opts = _pick(free, row, cfg["planner"], now)
     listener.tg.edit(message_id, *render(row, chunk, opts, note=f"{label}: {block['title']}. Pick a new time?"))
-    state.plan_item_set(row["id"], tg_message_id=message_id)
+    state.plan_item_set(row["id"], tg_message_id=message_id, sent_at=now.isoformat(), reminded=0)
 
 
 # --- /today ---------------------------------------------------------------------------------------------

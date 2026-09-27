@@ -517,6 +517,14 @@ class State:
         self.db.commit()
 
     def block_add(self, item_id, event_id, work_key, title, start, end, calendar=None):
+        """Records a block; if that event is already recorded (another process picked it up a moment ago), that row
+        is completed and returned instead of making a second one (which would mean two heads-ups)."""
+        existing = self.block_by_event(event_id) if event_id else None
+        if existing:
+            self.db.execute("UPDATE booked_blocks SET item_id = COALESCE(item_id, ?), work_key = COALESCE(work_key, ?), "
+                            "calendar = COALESCE(calendar, ?) WHERE id = ?", (item_id, work_key, calendar, existing["id"]))
+            self.db.commit()
+            return existing["id"]
         cur = self.db.execute("INSERT INTO booked_blocks (item_id, event_id, work_key, title, start, end, status, "
                               "created_at, calendar) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?)",
                               (item_id, event_id, work_key, title, start.isoformat(), end.isoformat(), _now(), calendar))

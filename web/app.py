@@ -68,14 +68,16 @@ def create_app(services=_services, state_factory=State, config=load_config):
         if request.host not in allowed:
             abort(403, "unknown host")  # stops DNS-rebinding tricks from other web pages
         user = web.get("tailscale_user")
-        if user and request.headers.get("Tailscale-User-Login") not in (None, user):
-            abort(403, "not your Tailscale login")
+        local = request.host.split(":")[0] in ("localhost", "127.0.0.1")
+        if user and not local and request.headers.get("Tailscale-User-Login") != user:
+            abort(403, "not your Tailscale login")  # via Tailscale the login must be yours (tagged devices have none)
         if request.method != "GET":
             origin = request.headers.get("Origin")
             if origin and origin.split("://", 1)[-1] not in allowed:
                 abort(403, "cross-site request")
-            if request.headers.get("X-CSRF-Token") != app.config["CSRF"]:
-                abort(403, "missing or wrong CSRF token")
+        if (request.method != "GET" or request.path.startswith("/api/")) and \
+                request.headers.get("X-CSRF-Token") != app.config["CSRF"]:
+            abort(403, "missing or wrong CSRF token")  # also for /api/state: another site can't make it read your calendars
 
     @app.after_request
     def headers(resp):
@@ -127,7 +129,8 @@ def create_app(services=_services, state_factory=State, config=load_config):
     def skip(block_id):
         c = ctx()
         block = c.state.block(block_id) or abort(404)
-        actions.skip_block(c.cfg, c.state, c.cal, block)
+        if not actions.skip_block(c.cfg, c.state, c.cal, block):
+            return jsonify(message=f"{block['title']} was already {actions._answered(block)}."), 409
         return jsonify(message=f"Skipped {block['title']}.")
 
     @app.post("/api/items/<int:item_id>/book")
