@@ -674,6 +674,10 @@ def main():
                 listener.report_error(e)
         if time.time() - last_sync > SYNC_BLOCKS_EVERY_S:
             try:
+                listener.cfg = load_config()  # settings changed on the web page reach the bot too
+            except Exception:
+                log.exception("couldn't reload config.yaml; keeping the old settings")
+            try:
                 for note in actions.sync_blocks(listener.cfg, listener.state, listener.calendar, datetime.now(listener._tz())):
                     log.info("calendar change: %s", note)
             except Exception as e:
