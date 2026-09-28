@@ -64,8 +64,14 @@ def main():
     print("  " + ("!!  Google login EXPIRED: run venv/bin/python auth.py" if state.get_meta("alert:auth") else "OK  Google login"))
     lost = llm.gpu_lost_since(state)
     busy = llm.gpu_busy(cfg["ollama"])
-    print("  " + (f"!!  GPU unavailable to Ollama since {lost.astimezone(tz):%H:%M} (send /check after fixing)" if lost else
-                  f"--  GPU busy right now ({busy}): emails wait until it's free" if busy else "OK  GPU free for the model"))
+    if not cfg["ollama"].get("require_gpu", True):
+        print(f"  OK  model {cfg['ollama']['model']} runs on the CPU (require_gpu: false)")
+    elif lost:
+        print(f"  !!  GPU unavailable to Ollama since {lost.astimezone(tz):%H:%M} (send /check after fixing)")
+    elif busy:
+        print(f"  --  GPU busy right now ({busy}): emails wait until it's free")
+    else:
+        print("  OK  GPU free for the model")
     waiting = int(state.get_meta("llm_waiting") or 0)
     if waiting:
         print(f"  --  {waiting} email(s) waiting for the model")
