@@ -49,7 +49,10 @@ They are listed in `.gitignore`.
 | `tests/` | pytest suite (no network: a fixture blocks Telegram, Google (httplib2), Ollama (httpx), systemd and the real login). `test_fixes.py` / `test_calfixes.py` hold one regression test per bug from the 26 Sep audit. Run `venv/bin/python -m pytest`. |
 | `eval_extractor.py` | Benchmarks Ollama models on 13 made-up emails with known answers: accuracy, speed, GPU fit, CPU temperature. `python eval_extractor.py gemma2:9b gemma3:4b` |
 | `status.py` | Is it running? Services, timers, last runs, login, GPU, recent problems, web page - one look. |
-| `list_calendars.py` | Prints your calendars' names and IDs, for filling in `config.yaml`. |
+| `SETUP.md` | How someone else sets up their own copy (their own Google access, Telegram bot, calendars; CPU-only model). |
+| `config.example.yaml` | `config.yaml` without your IDs, for a new copy (CPU-only model settings). |
+| `make_share.py` | Makes `~/calendar-agent-share.zip` for a friend: code only, checked for no logins, data or calendar IDs. |
+| `list_calendars.py` | Prints your calendars and Google Tasks lists with their IDs, for filling in `config.yaml`. |
 | `test_gmail.py` | Prints the 5 newest emails matching `gmail_query`, to check the query works. |
 | `requirements.txt` | Python dependencies. |
 | `credentials.json` | Google OAuth client (Desktop app). Secret. |
