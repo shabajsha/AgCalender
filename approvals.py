@@ -48,6 +48,7 @@ LOG_DIR = Path(__file__).parent / "logs"
 EXPIRE_EVERY_S = 600
 COMMANDS = [("today", "Today at a glance: events, your blocks, tasks without a time"),
             ("todo", "Add to-dos for today, e.g. /todo Lab report 2h"),
+            ("event", "Add a calendar event or deadline, e.g. /event Meeting with Harsha tomorrow 3pm"),
             ("deadlines", "Upcoming deadlines: done, effort, move the date, not doing"),
             ("habits", "Your habits and streaks; add a new one"),
             ("check", "Check mail (and your other calendars) now instead of waiting for the next 30-min run"),
@@ -68,7 +69,7 @@ LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
 SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo", "mv", "cx",
-                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp", "nl"}
+                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc", "evu", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp", "nl"}
 DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
 SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
 HABIT_ACTIONS = ("hbn", "hbm", "hbd", "hbw", "hbs", "hbx", "hbp", "hbr", "hby", "hbl")
@@ -191,6 +192,9 @@ class Listener:
         if action == "nl":  # the confirmation of a plan change you typed
             nlcommands.handle(self, cq, rest, now)
             return
+        if action == "evu":  # Undo under an event / deadline you added by typing
+            nlcommands.undo_event(self, cq, rest, now)
+            return
         if action in DEADLINE_ACTIONS:
             deadlines.handle(self, cq, action, rest, now)
             return
@@ -285,6 +289,14 @@ class Listener:
             self.add_todos(text, today)
         elif command == "/skipped":
             self.show_skipped()
+        elif command == "/event":
+            body = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+            if body:
+                nlcommands.add_event(self, body, now)
+            else:
+                self.tg.send("Send /event with what and when, e.g.\n/event Meeting with Harsha tomorrow 3pm\n"
+                             "/event SMAI quiz 5 Oct 10am for 2h\n/event DSA assignment due Friday 11:59pm\n"
+                             "(You can also just type it without /event.)")
         elif command == "/today":
             self.tg.send(*slotpicker.today_message(self.cfg, self.state, self.calendar, now))
         elif command == "/deadlines":

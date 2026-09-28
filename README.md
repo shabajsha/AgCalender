@@ -31,6 +31,7 @@ They are listed in `.gitignore`.
 | `habits.py` | Habits from Telegram (/habits): guided set-up, pause/delete, streaks; offered as free slots on their days. |
 | `deadlines.py` | /deadlines: Done / Effort / Date / Not doing for each upcoming deadline. |
 | `changes.py` | An email or invite that moves or cancels something you have: "Changed?" / "Cancelled?" cards instead of duplicates. |
+| `quickadd.py` | Turns "meeting with Harsha tomorrow at 3pm" / "X due Friday" into a calendar event or deadline (dates.py does the dates), created like an approved email card, with Undo. |
 | `daytimes.py` | One day's own wake-up / bedtime ("just woke up", "sleeping at 2am", "up at 9 tomorrow"), laid over the usual times by `config.load_config()`. |
 | `settings.py` | Settings you can change from Telegram (/settings) or the web page, validated; stored in state.db over config.yaml. |
 | `web/` | The web page (`web/app.py`, Flask, 127.0.0.1:8765): drag your blocks on a day timeline, plus tasks, deadlines, to-dos, habits, settings. `calendar-web.service`. |
@@ -205,6 +206,7 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | `/deadlines`, **Deadlines** | Each upcoming deadline with Done / Effort / Date (+1 day, +2 days, +1 week, or type one) / Not doing. |
 | `/habits`, **Habits** | Your habits with streaks; New habit walks you through name, length, days and time of day. |
 | `/settings`, **Settings** | Work hours, sleep, daily limit, block length, morning time, reminders, heads-up, evening check, exam prep... |
+| `/event ...` or just type it | Adds a **calendar event** or **deadline**: "meeting with Harsha tomorrow at 3pm", "SMAI quiz on 5 Oct 10am for 2h", "Megathon demo 12 Oct 2-4pm", "DSA assignment due Friday 11:59pm". Asks Yes / Cancel first; then Undo. Deadlines get a task and effort buttons, exams get prep time planned before them. |
 | *typing a change* | "move SDET study to 7pm", "leetcode not today", "busy 2-5pm", "make midsem prep 10 hours", "add gym at 6pm for 1h", "swap SMAI and SDET A2", "push leetcode by 30 min". Always asks Yes / Cancel first. |
 | `/clear` | Removes today's planner-made blocks that haven't started (also the **Clear today's plan** button). Blocks already worked stay: later plans count them as done. |
 | `/pause` | Stops reading mail. Your other calendars are still checked, buttons on existing cards still work, and the digest still arrives, noting the pause. |

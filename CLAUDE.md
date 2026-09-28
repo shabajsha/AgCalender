@@ -82,6 +82,11 @@ The repo is under git (local only). Commit at the end of each phase with the Co-
   words, guarded by `llm.chat_json`); `find` fuzzy-matches the task among `targets` (booked blocks, today's items,
   deadlines/exams, habits); `propose` returns a question + proposal stored in `meta nl:<n>`; `nl:y|n|t` taps apply it
   via actions. Plain text outside the check-in and outside a waiting conversation goes here before the help text.
+- **Adding events by typing (`quickadd.py`):** nlcommands rules `deadline` / `event` (and `add` when the title has an
+  event word, `quickadd.EVENT_WORDS`; otherwise `add` stays a to-do + block) -> `propose_event` builds an item like an
+  email item (`quickadd.build`: dates.py for day/time, bare "at 3" read as daytime, past refused) -> confirm ->
+  `quickadd.create` = `google_writer.create_item` + `record_item` (`msg_id` "telegram"), reply with `evu:<event>` Undo,
+  `dle:` effort buttons for deadlines, `prep:` for exams. `/event <text>` forces an event.
 - **Conversations:** a button that asks you to type (a setting value, a habit's name, a due date) stores
   `meta conv` via `state.set_conv(now, flow, ...)` (15 min); `Listener.handle_message` routes the next plain message to
   `settings.typed` / `habits.typed` / `deadlines.typed`.
