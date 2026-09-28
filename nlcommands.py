@@ -35,6 +35,16 @@ RULES = [
                         r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*$", re.I)),
     ("show", re.compile(r"^(?:what(?:'s| is)?\s+)?(?:my\s+)?(?:schedule|plan|agenda|timetable)(?:\s+(?P<when>today|tomorrow))?\??$", re.I)),
     ("show", re.compile(r"^what(?:'s| is)\s+(?:scheduled|planned|on|next)\b.*$", re.I)),
+    # your own times for a day (daytimes.py): no confirmation needed, and a button to go back to the usual time
+    ("woke", re.compile(r"^(?:i\s+)?(?:just\s+)?(?:woke(?:\s+up)?|got up|am up|i'?m up|up now|awake now|i'?m awake)"
+                        r"(?:\s+(?:late|now|just now))?(?:\s+(?:at|around)\s+(?P<when>.+))?$", re.I)),
+    ("wake_tomorrow", re.compile(r"^(?:i'?ll\s+|i will\s+|i'?m\s+|i am\s+)?(?:wake|waking|get|getting)?\s*up\s+"
+                                 r"(?:at|around|by)?\s*(?P<when>.+?)\s+tomorrow$", re.I)),
+    ("wake_tomorrow", re.compile(r"^tomorrow\s+(?:i'?ll\s+|i will\s+)?(?:wake|get)\s+up\s+(?:at|around)?\s*(?P<when>.+)$", re.I)),
+    ("bedtime", re.compile(r"^(?:i'?m\s+|i am\s+|i'?ll\s+be\s+|i will\s+be\s+|i'?ll\s+|i will\s+)?(?:sleeping|going to (?:bed|sleep)"
+                           r"|sleep|bed|bedtime)(?P<late>\s+late)?(?:\s+tonight)?(?:\s+(?:at|around|by|till|until|after)\s*"
+                           r"(?P<when>.+?))?(?:\s+tonight)?$", re.I)),
+    ("bedtime", re.compile(r"^(?:an?\s+)?(?P<late>early|late) night(?:\s*,?\s*(?:bed|sleep(?:ing)?)?\s*(?:at|around|by)?\s*(?P<when>.+))?$", re.I)),
     ("swap", re.compile(r"^swap\s+(?P<task>.+?)\s+(?:and|with)\s+(?P<task2>.+)$", re.I)),
     ("push", re.compile(r"^(?:push|delay|postpone)\s+(?P<task>.+?)\s+by\s+(?P<duration>.+)$", re.I)),
     ("busy", re.compile(r"^(?:i'?m\s+|i am\s+|i\s+)?(?:busy|not free|unavailable|away|out|blocked|can'?t do anything|cannot do anything"
@@ -265,6 +275,9 @@ def handle_text(listener, text, now):
             return False
     if parsed is None:
         return False
+    if parsed["action"] in ("woke", "wake_tomorrow", "bedtime"):
+        day_times(listener, parsed, now)
+        return True
     if parsed["action"] == "show":  # "what's scheduled today?" - no change, just the day
         import slotpicker
         day = resolve_date(parsed.get("when") or "today", now.date()) or now.date()
@@ -280,6 +293,62 @@ def handle_text(listener, text, now):
     listener.tg.send(reply, buttons(n, proposal))
     log.info("proposed %s for %r", proposal["op"], text)
     return True
+
+
+def _bare_hour(text, bedtime):
+    """ "10" / "9:30" without am/pm: a wake-up time is in the morning; a bedtime of 6-11 is in the evening and
+    12-5 is after midnight."""
+    m = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*", text or "")
+    if not m or not 1 <= int(m[1]) <= 12:
+        return None
+    h, minute = int(m[1]), int(m[2] or 0)
+    if bedtime:
+        h = h + 12 if 6 <= h <= 11 else 0 if h == 12 else h
+    else:
+        h = 0 if h == 12 else h
+    return datetime.min.replace(hour=h, minute=minute).time()
+
+
+def day_times(listener, parsed, now):
+    """Woke up late / going to bed late / up later tomorrow: stored for that one day (daytimes.py)."""
+    import daytimes
+    import morning
+    import slotpicker
+    from config import load_config
+    today, when = now.date(), parsed.get("when")
+    t = (resolve_time(when) or _bare_hour(when, parsed["action"] == "bedtime")) if when else None
+    if parsed["action"] == "woke":
+        wake = t or now.time()
+        daytimes.set_time(listener.state, today, "wake", f"{wake:%H:%M}")
+        listener.cfg = load_config()
+        run = getattr(listener, "_run_script", None)
+        if listener.state.get_meta(morning.MORNING_SENT) == today.isoformat():
+            started = run("planner.py", unit="calendar-plan-now") if run else False
+            reply = (f"Good morning! Up since {wake:%H:%M}. Your morning already ran without you, so here come "
+                     "free slots for the rest of today." if started is True else f"Up since {wake:%H:%M}. Tap 'Plan rest of today' for free slots.")
+        else:
+            started = run("morning.py", "--tick", unit="calendar-morning-now") if run else False
+            reply = f"Good morning! Up since {wake:%H:%M}, so your morning starts now: the check-in follows."
+        listener.tg.send(reply, [[("Use the usual time", f"dtc:w:{today.isoformat()}")]])
+        return
+    if parsed["action"] == "wake_tomorrow":
+        if t is None:
+            listener.tg.send("What time tomorrow?", [slotpicker.day_time_buttons(today)[1]])
+            return
+        tomorrow = today + timedelta(days=1)
+        daytimes.set_time(listener.state, tomorrow, "wake", f"{t:%H:%M}")
+        listener.cfg = load_config()
+        listener.tg.send(f"OK: up at {t:%H:%M} tomorrow. The check-in waits until then, and nothing pings you before.",
+                         [[("Use the usual time", f"dtc:w:{tomorrow.isoformat()}")]])
+        return
+    if t is None:  # "sleeping late" / "bed at 11" (no am/pm): ask with buttons
+        listener.tg.send("What time are you going to bed tonight? (or type e.g. 'sleeping at 1:30am')",
+                         [slotpicker.day_time_buttons(today)[0]])
+        return
+    daytimes.set_time(listener.state, today, "sleep", f"{t:%H:%M}")
+    listener.cfg = load_config()
+    listener.tg.send(f"OK: bed tonight at {t:%H:%M}. Free slots run until then, and no heads-ups or questions after.",
+                     [[("Plan rest of today", "tdp:"), ("Use the usual time", f"dtc:s:{today.isoformat()}")]])
 
 
 def handle(listener, cq, rest, now):

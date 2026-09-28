@@ -672,3 +672,16 @@ def read_settings(path=None):
             return {k: json.loads(v) for k, v in db.execute("SELECT key, value FROM settings")}
     except sqlite3.Error:
         return {}
+
+
+def read_meta(path=None):
+    """A read-only meta lookup (key -> value or None) without creating or migrating anything."""
+    path = Path(path or DB_PATH)
+    values = {}
+    if path.exists():
+        try:
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+                values = dict(db.execute("SELECT key, value FROM meta WHERE key LIKE 'day:%'").fetchall())
+        except sqlite3.Error:
+            pass
+    return lambda key: values.get(key) or None

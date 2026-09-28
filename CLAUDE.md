@@ -85,6 +85,13 @@ The repo is under git (local only). Commit at the end of each phase with the Co-
 - **Conversations:** a button that asks you to type (a setting value, a habit's name, a due date) stores
   `meta conv` via `state.set_conv(now, flow, ...)` (15 min); `Listener.handle_message` routes the next plain message to
   `settings.typed` / `habits.typed` / `deadlines.typed`.
+- **One day's own times (`daytimes.py`):** `meta day:<date>` = {wake, sleep}. `config.load_config()` calls
+  `daytimes.apply` for today: sets `planner.plan_after` (wake), trims/extends `work_window` (wake + 30 min, bedtime
+  - 30 min, "23:59" for bedtimes after midnight) and stores `planner.sleep_nights` (last night + tonight, using
+  yesterday's bedtime and tomorrow's wake). Anything that needs sleep intervals must use
+  `daytimes.sleep_for(pc, day, tz, slots.sleep_intervals)` (planner.free_today, slotpicker._asleep), never
+  `slots.sleep_intervals` directly. Typed phrases are `woke` / `wake_tomorrow` / `bedtime` rules in nlcommands
+  (applied at once, `dtc:` undo); the evening check has `dt:s|w:<date>:<HHMM>` buttons.
 - **Settings:** `settings.SETTINGS` is the registry (kind, choices, limits); values live in the `settings` table and
   `config.load_config()` lays them over config.yaml (`state.read_settings`, read-only). After changing one the listener
   reloads `self.cfg`.

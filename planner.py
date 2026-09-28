@@ -257,8 +257,10 @@ def free_today(cal, cfg, state, now, ignore_ids=frozenset()):
                   if calwatch.counts_as_busy(policies.get(cid, "internal"), statuses.get((cid, calwatch.event_key(e))))
                   and e["id"] not in ignore_ids]
         busy += busy_intervals(events, tz)
+    import daytimes  # today's own wake-up / bedtime, if you set one
     return slots.subtract([(max(slots.round_up(now), day_start), day_end)],
-                          slots.pad(busy, cfg["planner"]["gap_minutes"]) + slots.sleep_intervals(today, pc["sleep"], tz))
+                          slots.pad(busy, cfg["planner"]["gap_minutes"])
+                          + daytimes.sleep_for(pc, today, tz, slots.sleep_intervals))
 
 
 def block_minutes(cal, cfg, state, now, ignore_ids=frozenset()):

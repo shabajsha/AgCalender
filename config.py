@@ -19,7 +19,13 @@ def load_config(overrides=True):
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
     if overrides:
-        from state import read_settings  # here: state imports nothing from config, but keep config light
+        from state import read_meta, read_settings  # here: state imports nothing from config, but keep config light
         for key, value in read_settings().items():
             _set(cfg, key, value)
+        # today's own times (woke up late, going to bed late): see daytimes.py
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        import daytimes
+        daytimes.apply(cfg, read_meta(), datetime.now(ZoneInfo(cfg.get("timezone", "Asia/Kolkata"))).date())
     return cfg

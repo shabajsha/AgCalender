@@ -191,9 +191,9 @@ def send_waiting(cfg, state, now, tg, work_free, resend=False):
 def handle(listener, cq, action, rest, now):
     cfg, state, tg = listener.cfg, listener.state, listener.tg
     pc, today, message_id = cfg["planner"], now.date(), cq["message"]["message_id"]
-    if action in ("bkd", "eve", "prep", "hu", "mvb"):
+    if action in ("bkd", "eve", "prep", "hu", "mvb", "dt", "dtc"):
         return {"bkd": _answer_block, "eve": _evening_answer, "prep": _set_prep, "hu": _heads_up_answer,
-                "mvb": _move_to}[action](listener, message_id, rest, now)
+                "mvb": _move_to, "dt": _day_time, "dtc": _day_time_clear}[action](listener, message_id, rest, now)
     raw_id, _, arg = rest.partition(":")
     row = state.plan_item(int(raw_id)) if raw_id.isdigit() else None
     if row is None:
@@ -317,7 +317,8 @@ def _move_task(listener, row, day):
 # --- every 15 minutes (morning.py --tick): "Did you finish?", one reminder, the evening check ---------------------
 
 def _asleep(cfg, now):
-    return any(s <= now < e for s, e in slots.sleep_intervals(now.date(), cfg["planner"]["sleep"], now.tzinfo))
+    import daytimes
+    return any(s <= now < e for s, e in daytimes.sleep_for(cfg["planner"], now.date(), now.tzinfo, slots.sleep_intervals))
 
 
 def tick(cfg, state, now, tg, services):
@@ -375,15 +376,43 @@ def evening_text(state, rows, today):
             untimed.append(r["title"])
         movable += 1 if r["list_id"] else 0
     lines = [f"Evening check - {today:%a %d %b}"]
+    time_rows = day_time_buttons(today)
     for head, names in (("Done", done), ("Not done / partly", notdone), ("Not answered yet (buttons above)", unanswered),
                         ("No time picked", untimed)):
         if names:
             lines.append(f"{head}: " + ", ".join(names))
-    buttons = None
+    buttons = []
     if movable:
         lines.append("\nMove your unfinished to-dos to tomorrow? (Deadline and exam work carries over by itself.)")
         buttons = [[("Move to tomorrow", f"eve:m:{today.isoformat()}"), ("Leave as is", f"eve:k:{today.isoformat()}")]]
-    return "\n".join(lines), buttons
+    lines.append("\nGoing to bed late, or getting up later tomorrow? Tap a time (or type e.g. 'sleeping at 2am').")
+    return "\n".join(lines), buttons + time_rows
+
+
+BEDTIMES = ["23:30", "00:30", "01:30", "02:30"]
+WAKE_TIMES = ["07:00", "08:00", "09:00", "10:00"]
+
+
+def day_time_buttons(today):
+    tomorrow = today + timedelta(days=1)
+    return [[(f"Bed {t}", f"dt:s:{today.isoformat()}:{t.replace(':', '')}") for t in BEDTIMES],
+            [(f"Up {t}", f"dt:w:{tomorrow.isoformat()}:{t.replace(':', '')}") for t in WAKE_TIMES]]
+
+
+def _day_time(listener, message_id, rest, now):
+    """dt:<s|w>:<date>:<HHMM> - tonight's bedtime or a wake-up time, from the evening check's buttons."""
+    import daytimes
+    from config import load_config
+    field, _, rest = rest.partition(":")
+    day_s, _, hhmm = rest.partition(":")
+    if field not in ("s", "w") or len(hhmm) != 4:
+        return
+    value = f"{hhmm[:2]}:{hhmm[2:]}"
+    daytimes.set_time(listener.state, date.fromisoformat(day_s), "sleep" if field == "s" else "wake", value)
+    listener.cfg = load_config()
+    listener.tg.send(f"OK: bed tonight at {value}. No questions after that, and free slots run until then." if field == "s"
+                     else f"OK: up at {value} on {date.fromisoformat(day_s):%a}. The check-in waits until then, and "
+                          "nothing pings you before.")
 
 
 def _evening_answer(listener, message_id, rest, now):
@@ -528,8 +557,11 @@ def today_message(cfg, state, cal, now, day=None):
     today = now.date()
     day = day or today
     actions.sync_if_stale(cfg, state, cal, now)
+    import daytimes
     head = "Today" if day == today else "Tomorrow" if day == today + timedelta(days=1) else f"{day:%A}"
-    lines = [f"{head} - {day:%a %d %b}", "", "Events"] + digest.events_today(cfg, cal, state, now, day=day)
+    times = daytimes.describe(cfg["planner"], day) if day == today else ""
+    lines = [f"{head} - {day:%a %d %b}"] + ([times] if times else []) + ["", "Events"] \
+        + digest.events_today(cfg, cal, state, now, day=day)
     blocks = sorted((b for b in state.blocks() if datetime.fromisoformat(b["start"]).astimezone(now.tzinfo).date() == day
                      and b["status"] != "cleared"), key=lambda b: b["start"])
     lines += ["", "Your blocks"] + ([f"- {datetime.fromisoformat(b['start']).astimezone(now.tzinfo):%H:%M}-"
@@ -540,3 +572,15 @@ def today_message(cfg, state, cal, now, day=None):
         lines += ["", "No time picked yet"] + [f"- {r['title']}: {fmt(r['minutes'])}" for r in waiting]
     buttons = [[("Plan rest of today", "tdp:"), ("Clear today's plan", f"clear:{today.isoformat()}")]] if day == today else None
     return "\n".join(lines), buttons
+
+
+def _day_time_clear(listener, message_id, rest, now):
+    """dtc:<s|w>:<date> - back to the usual bedtime / wake-up time for that day."""
+    import daytimes
+    from config import load_config
+    field, _, day_s = rest.partition(":")
+    if field not in ("s", "w"):
+        return
+    daytimes.set_time(listener.state, date.fromisoformat(day_s), "sleep" if field == "s" else "wake", None)
+    listener.cfg = load_config()
+    listener.tg.edit(message_id, "OK, back to your usual " + ("bedtime." if field == "s" else "wake-up time."))

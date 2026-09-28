@@ -31,6 +31,7 @@ They are listed in `.gitignore`.
 | `habits.py` | Habits from Telegram (/habits): guided set-up, pause/delete, streaks; offered as free slots on their days. |
 | `deadlines.py` | /deadlines: Done / Effort / Date / Not doing for each upcoming deadline. |
 | `changes.py` | An email or invite that moves or cancels something you have: "Changed?" / "Cancelled?" cards instead of duplicates. |
+| `daytimes.py` | One day's own wake-up / bedtime ("just woke up", "sleeping at 2am", "up at 9 tomorrow"), laid over the usual times by `config.load_config()`. |
 | `settings.py` | Settings you can change from Telegram (/settings) or the web page, validated; stored in state.db over config.yaml. |
 | `web/` | The web page (`web/app.py`, Flask, 127.0.0.1:8765): drag your blocks on a day timeline, plus tasks, deadlines, to-dos, habits, settings. `calendar-web.service`. |
 | `slotpicker.py` | You choose when: one Telegram message per task with free slots as buttons, booking, "Did you finish?" after each slot, one reminder, the evening check, `/exams`. |
@@ -299,6 +300,20 @@ Study SDET MidSem
   cancelled invites are matched by their UID.
 - **Settings** (`/settings`, or the web page): each change is checked and stored in `state.db`; every script uses it
   from its next run. Reset goes back to `config.yaml`.
+
+## Woke up late? Sleeping late?
+
+Your usual times are in `/settings` (Sleep, Morning starts at, Work hours). For **one day**, just tell the bot:
+
+| You type | What happens |
+|---|---|
+| `just woke up` / `woke up at 10` | Today starts then: the morning check-in comes now (or, if it already ran without you, fresh free slots from now). No pings before that time. |
+| `up at 9 tomorrow` | Tomorrow's check-in waits until 9, and nothing pings you before. |
+| `sleeping at 2am` / `bed at 11 tonight` / `early night` | Tonight's bedtime: free slots run until 30 min before it, and no heads-ups or questions after it. |
+
+The evening check also has **Bed 23:30 / 00:30 / 01:30 / 02:30** and **Up 07:00 ... 10:00** buttons. Each reply has
+**Use the usual time** to undo it, and the next day goes back to your usual times by itself. Bare hours are read
+sensibly: "up at 9" is morning, "bed at 11" is evening, "bed at 1" is after midnight.
 
 ## Web page
 
