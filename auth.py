@@ -25,8 +25,9 @@ class AuthExpired(Exception):
 
 
 def _save(creds):
-    """Atomic write, readable only by you from the moment the file exists."""
-    tmp = TOKEN_FILE.with_name(TOKEN_FILE.name + ".tmp")
+    """Atomic write, readable only by you from the moment the file exists. The temp file is per process: at wake-up
+    two jobs refresh the login at once, and a shared temp name made one of them crash (28 Sep, 09:35)."""
+    tmp = TOKEN_FILE.with_name(f"{TOKEN_FILE.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(creds.to_json())

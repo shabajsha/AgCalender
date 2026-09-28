@@ -58,3 +58,23 @@ def test_guard_turns_expired_login_into_one_alert(monkeypatch):
     with pytest.raises(SystemExit):
         main()
     assert sent == ["auth"]
+
+
+def test_two_processes_saving_the_login_at_once(monkeypatch, tmp_path):
+    """At wake-up the morning tick and the mail check both refresh the token; neither may crash."""
+    import os
+    monkeypatch.setattr(auth, "TOKEN_FILE", tmp_path / "token.json")
+    creds = type("C", (), {"to_json": lambda self: json.dumps({"x": 1})})()
+    pids = iter([111, 222])
+    monkeypatch.setattr(os, "getpid", lambda: next(pids))
+    real_replace = os.replace
+    first = {}
+
+    def slow_replace(src, dst):      # the first save's rename happens after the second one started
+        if not first:
+            first["src"] = src
+            auth._save(creds)        # the other process saves in between
+        real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", slow_replace)
+    auth._save(creds)
+    assert (tmp_path / "token.json").exists() and not list(tmp_path.glob("*.tmp"))

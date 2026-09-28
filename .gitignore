@@ -19,3 +19,4 @@ state.db-journal
 .pytest_cache/
 token.json.tmp
 backups/
+token.json.*.tmp
