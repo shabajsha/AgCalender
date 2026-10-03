@@ -36,7 +36,7 @@ venv/bin/python list_calendars.py  # calendar names + IDs for config.yaml
 
 Tests: `venv/bin/python -m pytest` (config in `pytest.ini`, `pythonpath = .`). `tests/conftest.py` has an autouse fixture that points `state.DB_PATH`, `logsetup.LOG_DIR`, `planner.LOCK_FILE`, `calwatch.LOCK_FILE`, `morning.BACKUP_DIR` and `auth.TOKEN_FILE` at a temp dir and makes Telegram, `requests`, `httplib2.Http.request` (Google), `httpx.Client.send` (Ollama) and `subprocess.run/Popen` raise, so an unmocked outside call fails loudly instead of messaging the user. Keep that property when adding tests. Fakes: `FakeTelegram` (asserts each tap is answered at most once, so tap helpers need unique callback ids), `FakeTasks`, `FakeCalendar` (`instances()`, and `get()` also finds copies it inserted), `event()`. `tests/test_fixes.py` and `tests/test_calfixes.py` are the regression tests for the 26 Sep audit. The `test_*.py` files in the project root are old manual smoke tests against live Google APIs, not part of the suite.
 
-The repo is under git (local only). Commit at the end of each phase with the Co-Authored-By line; never commit secrets (`.gitignore` covers them).
+The repo is under git, pushed to GitHub (`origin`). Commit at the end of each phase as the user (Shabaj), with no Co-Authored-By or other Claude attribution line; never commit secrets (`.gitignore` covers them).
 
 ## Architecture
 
