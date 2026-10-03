@@ -152,6 +152,17 @@ def create_app(services=_services, state_factory=State, config=load_config):
         moved = slotpicker._move_task(c.lis, item, c.now.date() + timedelta(days=1))
         return jsonify(message=f"{item['title']}: not today." + (" Moved to tomorrow." if moved else ""))
 
+    @app.post("/api/items/<int:item_id>/drop")
+    def drop(item_id):
+        c = ctx()
+        item = c.state.plan_item(item_id) or abort(404)
+        if item["kind"] == "habit":
+            return jsonify(message="Habits are paused or deleted in the Habits panel."), 400
+        if item["status"] == "dropped":
+            return jsonify(message=f"{item['title']}: already dropped."), 409
+        note = actions.discard(c.cfg, c.state, c.cal, c.tasks, item["work_key"], c.now, item["list_id"])
+        return jsonify(message=f"Dropped: {item['title']}. {note or ''}".strip())
+
     @app.post("/api/todos")
     def add_todos():
         c = ctx()
@@ -295,7 +306,8 @@ def page_state(c, day):
                 continue
             chunk, opts = slotpicker._pick(free, row, c.cfg["planner"], c.now)
             waiting.append({"id": row["id"], "title": row["title"], "minutes": row["minutes"], "kind": row["kind"],
-                            "due": row["due"], "chunk": chunk, "options": [[s.isoformat(), e.isoformat()] for s, e in opts]})
+                            "due": row["due"], "chunk": chunk, "options": [[s.isoformat(), e.isoformat()] for s, e in opts],
+                            "drop": None if row["kind"] == "habit" else actions.drop_question(row["kind"], row["title"])})
     dls = [{"id": ev["id"], "title": ev["summary"][len(google_writer.DUE_PREFIX):], "due": _iso(deadlines._due(ev, tz), tz),
             "effort": planner._effort(c.state, f"event:{ev['id']}", c.cfg["planner"]["default_effort_hours"])}
            for ev in deadlines.upcoming(c.cfg, c.cal, c.now)]

@@ -210,7 +210,7 @@ Send these to the bot (they're also in its menu button). Only your own chat is o
 | `/habits`, **Habits** | Your habits with streaks; New habit walks you through name, length, days and time of day. |
 | `/settings`, **Settings** | Work hours, sleep, daily limit, block length, morning time, reminders, heads-up, evening check, exam prep... |
 | `/event ...` or just type it | Adds a **calendar event** or **deadline**: "meeting with Harsha tomorrow at 3pm", "SMAI quiz on 5 Oct 10am for 2h", "Megathon demo 12 Oct 2-4pm", "DSA assignment due Friday 11:59pm". Asks Yes / Cancel first; then Undo. Deadlines get a task and effort buttons, exams get prep time planned before them. |
-| *typing a change* | "move SDET study to 7pm", "leetcode not today", "busy 2-5pm", "make midsem prep 10 hours", "add gym at 6pm for 1h", "swap SMAI and SDET A2", "push leetcode by 30 min". Always asks Yes / Cancel first. |
+| *typing a change* | "move SDET study to 7pm", "leetcode not today", "drop leetcode for good", "busy 2-5pm", "make midsem prep 10 hours", "add gym at 6pm for 1h", "swap SMAI and SDET A2", "push leetcode by 30 min". Always asks Yes / Cancel first. |
 | `/clear` | Removes today's planner-made blocks that haven't started (also the **Clear today's plan** button). Blocks already worked stay: later plans count them as done. |
 | `/pause` | Stops reading mail. Your other calendars are still checked, buttons on existing cards still work, and the digest still arrives, noting the pause. |
 | `/skipped` | Emails the pre-filter skipped (no deadline words), newest first, with **Read** buttons to run the model on one anyway. |
@@ -264,12 +264,17 @@ After the check-in (or on **Plan rest of today**) each task that needs time toda
 Study SDET MidSem
 2 h to do today (due Sun 27 Sep 23:59). Pick a time for the first 1 h 30 min:
 [11:00-12:30] [14:00-15:30] [19:00-20:30]
-[More times] [Not today]
+[More times] [Not today] [Drop it]
 ```
 
 - The slots are real free time (all your calendars, gaps, sleep), spread over morning / afternoon / evening, and
   never after the task is due. Tapping one books it on the Planner calendar; the other messages update so that time
   isn't offered twice. **Nothing is booked until you tap.** *Not today* moves a to-do to tomorrow.
+- *Drop it* is for a task you won't do at all. It asks first ("Drop ... for good?" Yes / Back), then deletes the
+  to-do from Google Tasks (a deadline: its DUE event and task; exam prep: set to none, the exam stays) and its
+  upcoming work blocks. It's also offered after *Not done* when nothing more fits today, on the web page, and by
+  typing "drop X for good", "discard X" or "not doing X at all" (plain "drop X" only means not today). Habits are
+  paused or deleted in /habits instead.
 - A task you haven't given a time gets **one reminder** `morning.remind_after_minutes` (2 h) later, with fresh slots.
 - When a booked slot ends: **"Did you finish ...?" Done / Partly / Not done.** Done ticks the to-do off in Google Tasks
   once its time is all done; Partly or Not done offers new slots. Your answers count (done 100%, partly 50%, not

@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS plan_items (
     list_id       TEXT,           -- the task's Google Tasks list (to tick it off or move it)
     minutes       INTEGER,        -- still to be given a time today
     tg_message_id INTEGER,        -- its "when?" message
-    status        TEXT,           -- open / booked / skipped
+    status        TEXT,           -- open / booked / skipped / dropped
     reminded      INTEGER DEFAULT 0,
     sent_at       TEXT,           -- when its "when?" message went out (the reminder counts from here)
     created_at    TEXT,

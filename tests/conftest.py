@@ -89,7 +89,7 @@ class FakeTasks:
     """Just enough of the Google Tasks client for todos.py: tasks().insert/delete(...).execute()."""
 
     def __init__(self, fail_on=None):
-        self.store, self._n, self.fail_on, self.patched = {}, 0, fail_on, []
+        self.store, self._n, self.fail_on, self.patched, self.deleted = {}, 0, fail_on, [], []
 
     def tasks(self):
         return self
@@ -103,6 +103,7 @@ class FakeTasks:
         return _Exec({"id": task_id})
 
     def delete(self, tasklist, task):
+        self.deleted.append((tasklist, task))
         self.store.pop(task, None)
         return _Exec(None)
 

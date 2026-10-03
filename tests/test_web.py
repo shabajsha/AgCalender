@@ -121,3 +121,15 @@ def test_settings_and_habits(web):
                                      "window_end": "17:00"}).status_code == 400
     [h] = web.db.habits()
     assert (h["name"], h["days"]) == ("Gym", "mon,fri")
+
+
+def test_drop_from_the_web_page(web, monkeypatch):
+    monkeypatch.setattr(google_writer, "list_blocks", lambda cal, cid, s, e: [])
+    item = web.db.plan_item_upsert(web.now.date(), "task:z", "Read paper", "task", (web.now + timedelta(hours=9)).isoformat(),
+                                   "DAILY", 60)
+    gym = web.db.plan_item_upsert(web.now.date(), "habit:1", "Gym", "habit", (web.now + timedelta(hours=9)).isoformat(), None, 30)
+    assert post(web, f"/api/items/{gym['id']}/drop").status_code == 400          # habits: pause them instead
+    r = post(web, f"/api/items/{item['id']}/drop")
+    assert r.status_code == 200 and r.get_json()["message"].startswith("Dropped: Read paper")
+    assert web.db.plan_item(item["id"])["status"] == "dropped"
+    assert post(web, f"/api/items/{item['id']}/drop").status_code == 409

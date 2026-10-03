@@ -178,7 +178,8 @@ function renderWaiting() {
       w.options.length ? w.options.map(([s, e]) => el("button", { class: "primary",
         onclick: () => act(`/api/items/${w.id}/book`, { start: s, minutes: w.chunk }) }, `${hm(s)}-${hm(e)}`))
         : el("span", { class: "muted" }, "No free slot left today."),
-      el("button", { onclick: () => act(`/api/items/${w.id}/not-today`) }, "Not today")))));
+      el("button", { onclick: () => act(`/api/items/${w.id}/not-today`) }, "Not today"),
+      w.drop ? el("button", { onclick: () => confirm(w.drop) && act(`/api/items/${w.id}/drop`) }, "Drop") : null))));
 }
 
 function renderDeadlines() {

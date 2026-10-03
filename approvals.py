@@ -70,7 +70,7 @@ LABELS = {"check mail now": "/check", "plan rest of today": "/plan", "status": "
 OFFLINE_AFTER_S = 300  # a command older than this was sent while the laptop was off or asleep
 # Taps that talk to Google (seconds): answered before the work starts, so the button stops spinning at once.
 SLOW_ACTIONS = {"cal", "calb", "cale", "calc", "calu", "calp", "crv", "crva", "add", "undo", "addundo", "mv", "cx",
-                "sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc", "evu", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp", "nl"}
+                "sgb", "sgm", "sgn", "dx", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc", "evu", "dl", "dle", "dlm", "dlt", "dlx", "dlb", "tdp", "nl"}
 DEADLINE_ACTIONS = ("dl", "dle", "dlm", "dlt", "dlx")
 SETTING_ACTIONS = ("set", "setv", "sett", "setr", "setb")
 HABIT_ACTIONS = ("hbn", "hbm", "hbd", "hbw", "hbs", "hbx", "hbp", "hbr", "hby", "hbl")
@@ -79,7 +79,7 @@ UNDO_ADD_WINDOW = timedelta(minutes=10)
 # its answer ("busy 2-5pm" typed after abandoning "Type a value" used to become your work hours).
 CONV_ACTIONS = {"habit": ("hbm", "hbd", "hbw", "hbs", "hbx")}
 # slotpicker.py: times, "Did you finish?", evening check, exams, heads-up, moving a block
-SLOT_ACTIONS = ("sgb", "sgm", "sgn", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc")
+SLOT_ACTIONS = ("sgb", "sgm", "sgn", "dx", "bkd", "eve", "prep", "hu", "mvb", "dt", "dtc")
 HEADS_UP_EVERY_S = 60
 SYNC_BLOCKS_EVERY_S = 300  # re-read your blocks from Google Calendar (you may move them in the Calendar app)
 # Typed instead of tapping the check-in buttons (a whole message, after lowercasing and trimming punctuation).

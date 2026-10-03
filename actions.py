@@ -143,6 +143,47 @@ def drop_deadline(cfg, state, cal, tasks_api, event_id, now):
     state.delete_item_by_event(event_id)
 
 
+def drop_question(kind, title):
+    """The confirmation asked before `discard` (it deletes things in Google, so it's never done on one tap)."""
+    return {"task": f"Drop {title} for good? The to-do is deleted from Google Tasks and its planned times are removed.",
+            "deadline": f"Drop {title} for good? This deletes the deadline, its task and its planned work.",
+            "exam": f"No preparation at all for {title}? Its prep blocks are removed; the exam stays on your calendar.",
+            }.get(kind, f"Drop {title} for good? It won't be suggested again and its planned times are removed.")
+
+
+def discard(cfg, state, cal, tasks_api, key, now, list_id=None):
+    """You're not doing it at all (after confirming drop_question). A to-do is deleted from Google Tasks, a deadline
+    loses its DUE event and task, exam prep is set to none; its upcoming work blocks are deleted and it leaves today's
+    list. Blocks you already worked on stay as history. Returns a short note on what happened."""
+    what, _, ident = (key or "").partition(":")
+    if what == "task":
+        _remove_future_work(cfg, state, cal, key, now)
+        if not list_id and ident in state.todo_task_ids():
+            list_id = cfg["morning"].get("todo_tasklist")
+        note = "Deleted from your tasks." if list_id else "Its planned times are removed."
+        if list_id:
+            try:
+                tasks_api.tasks().delete(tasklist=list_id, task=ident).execute()
+            except HttpError as e:
+                if e.resp.status not in (404, 410):
+                    raise
+    elif what == "event":
+        ev = _get(cal, cfg["calendars"]["college"], ident)
+        if ev is not None and not ev.get("summary", "").startswith(google_writer.DUE_PREFIX):
+            state.set_effort(key, 0)  # an exam: no prep (the exam itself is yours, never deleted)
+            _remove_future_work(cfg, state, cal, key, now)
+            note = "No prep will be planned for it."
+        else:
+            drop_deadline(cfg, state, cal, tasks_api, ident, now)
+            note = "The deadline, its task and its planned work are deleted."
+    else:
+        return None  # habits are paused or deleted in /habits
+    for row in state.plan_items(now.date()):
+        if row["work_key"] == key:
+            state.plan_item_set(row["id"], status="dropped", minutes=0)
+    return note
+
+
 def _remove_future_work(cfg, state, cal, key, now):
     removed = 0
     for b in future_blocks_for(cfg, cal, key, now):

@@ -114,7 +114,8 @@ def render(row, chunk, opts, note=""):
         lines.append("When? Free slots today:")
     rows = [[(f"{s:%H:%M}-{e:%H:%M}", f"sgb:{row['id']}:{s:%H%M}:{chunk}") for s, e in opts[i:i + 3]]
             for i in range(0, len(opts), 3)]
-    rows.append([("More times", f"sgm:{row['id']}"), ("Not today", f"sgn:{row['id']}")])
+    rows.append([("More times", f"sgm:{row['id']}"), ("Not today", f"sgn:{row['id']}")]
+                + ([] if row["kind"] == "habit" else [("Drop it", f"dx:a:i{row['id']}")]))
     return "\n".join(lines), rows
 
 
@@ -191,15 +192,18 @@ def send_waiting(cfg, state, now, tg, work_free, resend=False):
 def handle(listener, cq, action, rest, now):
     cfg, state, tg = listener.cfg, listener.state, listener.tg
     pc, today, message_id = cfg["planner"], now.date(), cq["message"]["message_id"]
-    if action in ("bkd", "eve", "prep", "hu", "mvb", "dt", "dtc"):
+    if action in ("bkd", "eve", "prep", "hu", "mvb", "dt", "dtc", "dx"):
         return {"bkd": _answer_block, "eve": _evening_answer, "prep": _set_prep, "hu": _heads_up_answer,
-                "mvb": _move_to, "dt": _day_time, "dtc": _day_time_clear}[action](listener, message_id, rest, now)
+                "mvb": _move_to, "dt": _day_time, "dtc": _day_time_clear, "dx": _drop}[action](listener, message_id, rest, now)
     raw_id, _, arg = rest.partition(":")
     row = state.plan_item(int(raw_id)) if raw_id.isdigit() else None
     if row is None:
         return
     if row["plan_date"] != today.isoformat():
         tg.edit(message_id, f"{row['title']}: this was for {row['plan_date']}. Tap 'Plan rest of today' for today's times.")
+        return
+    if row["status"] == "dropped":  # an older button on a task you've dropped since
+        tg.edit(message_id, f"{row['title']}: dropped, so there's nothing to plan.")
         return
     if action == "sgn":  # Not today
         state.plan_item_set(row["id"], status="skipped")
@@ -353,7 +357,7 @@ def tick(cfg, state, now, tg, services):
                   note="Still no time picked for this today:")
     evening = slots.at(today, mc.get("evening_check", "21:30"), now.tzinfo)
     if now >= evening and state.get_meta(EVENING_SENT) != today.isoformat():
-        rows = state.plan_items(today)
+        rows = [r for r in state.plan_items(today) if r["status"] != "dropped"]
         if rows:
             text, buttons = evening_text(state, rows, today)
             tg.send(text, buttons)
@@ -423,6 +427,8 @@ def _evening_answer(listener, message_id, rest, now):
         return
     moved = 0
     for r in state.plan_items(date.fromisoformat(day)):
+        if r["status"] == "dropped":
+            continue
         blocks = state.blocks(item_id=r["id"])
         finished = blocks and all(b["status"] == "done" for b in blocks) and r["minutes"] <= 0
         if not finished and _move_task(listener, r, date.fromisoformat(day) + timedelta(days=1)):
@@ -526,13 +532,51 @@ def _move_to(listener, message_id, rest, now):
     listener.tg.edit(message_id, text if ok else f"{text} Try one of these:", None if ok else _move_buttons(block, alternatives))
 
 
+def _drop(listener, message_id, rest, now):
+    """dx:<a|y|n>:<i<plan item>|b<block>> - Drop it (a), Yes (y), Back (n): not doing a task at all."""
+    import actions
+    state, tg = listener.state, listener.tg
+    op, _, ref = rest.partition(":")
+    if not ref[1:].isdigit():
+        return
+    if ref[0] == "i":
+        row = state.plan_item(int(ref[1:]))
+        if row is None:
+            return
+        key, title, kind, list_id = row["work_key"], row["title"], row["kind"], row["list_id"]
+    else:
+        block = state.block(int(ref[1:]))
+        if block is None or not block["work_key"]:
+            return
+        row = state.plan_item(block["item_id"]) if block["item_id"] else None
+        key, title, list_id = block["work_key"], block["title"], row and row["list_id"]
+        kind = row["kind"] if row else ("task" if key.startswith("task:") else None)
+    if row is not None and row["status"] == "dropped":
+        tg.edit(message_id, f"{title}: already dropped.")
+        return
+    if op == "a":
+        tg.edit(message_id, actions.drop_question(kind, title), [[("Yes, drop it", f"dx:y:{ref}"), ("Back", f"dx:n:{ref}")]])
+    elif op == "y":
+        note = actions.discard(listener.cfg, state, listener.calendar, listener.tasks, key, now, list_id)
+        tg.edit(message_id, f"Dropped: {title}. {note or ''}".strip())
+        log.info("dropped %r (%s)", title, key)
+    elif op == "n" and ref[0] == "i" and row["status"] == "open" and row["plan_date"] == now.date().isoformat():
+        work_free, _, _ = planner.work_context(listener.cfg, state, now, listener.calendar, listener.tasks)
+        chunk, opts = _pick(work_free, row, listener.cfg["planner"], now)
+        tg.edit(message_id, *render(row, chunk, opts))
+    elif op == "n":
+        tg.edit(message_id, f"{title}: kept. It'll be in the next suggestions.")
+
+
 def _reoffer(listener, message_id, block, now, label):
     """After Skip / Not done: new times for what's left today."""
     cfg, state = listener.cfg, listener.state
     free, items, _ = planner.work_context(cfg, state, now, listener.calendar, listener.tasks)
     item = next((it for it in items if it["key"] == block["work_key"]), None)
     if item is None or item["need"] <= 0:
-        listener.tg.edit(message_id, f"{label}: {block['title']}. It'll be in tomorrow's suggestions.")
+        listener.tg.edit(message_id, f"{label}: {block['title']}. It'll be in tomorrow's suggestions.",
+                         [[("Drop it for good", f"dx:a:b{block['id']}")]] if block["work_key"] and
+                         not block["work_key"].startswith("habit:") else None)
         return
     row = state.plan_item_upsert(now.date(), item["key"], item["title"], item.get("kind", "task"), item["due"].isoformat(),
                                  item.get("list_id"), item["need"])
