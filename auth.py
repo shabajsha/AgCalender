@@ -34,6 +34,15 @@ def _save(creds):
     os.replace(tmp, TOKEN_FILE)
 
 
+def token_stamp():
+    """When token.json last changed (None if missing). The long-running bot and web page compare this to notice a
+    new login: they keep the credentials they loaded in memory, and the old ones stay revoked after `auth.py`."""
+    try:
+        return TOKEN_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 def _is_interactive():
     return sys.stdin is not None and sys.stdin.isatty()
 
@@ -82,7 +91,7 @@ def new_login():
 if __name__ == "__main__":
     if "--new" in sys.argv[1:]:
         new_login()
-        print("New login saved to token.json. Now run: systemctl --user restart calendar-approvals calendar-web")
+        print("New login saved to token.json. The bot and web page pick it up within a minute.")
     else:
         get_credentials(interactive=True)
-        print("Authenticated OK; token saved to token.json")
+        print("Authenticated OK; token saved to token.json. The bot and web page pick it up within a minute.")

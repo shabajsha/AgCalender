@@ -304,3 +304,22 @@ def test_editing_a_deleted_message_does_not_raise(monkeypatch):
     monkeypatch.setattr(tg, "call", lambda *a, **k: (_ for _ in ()).throw(
         telegram_bot.TelegramError("editMessageText: Bad Request: message to edit not found")))
     assert tg.edit(5, "hi") is False
+
+
+def test_listener_picks_up_new_login(monkeypatch):
+    """3 Oct: after `auth.py` the running bot kept its old, revoked credentials and kept saying "login expired"."""
+    import approvals
+    import auth
+    made = []
+    monkeypatch.setattr(approvals, "get_credentials", lambda: f"creds{len(made)}")
+    monkeypatch.setattr(approvals, "build", lambda api, v, credentials: made.append(credentials) or (api, credentials))
+    lis = approvals.Listener.__new__(approvals.Listener)
+    auth.TOKEN_FILE.write_text("{}")
+    lis.connect()
+    assert lis.reconnect_if_new_login() is False      # same token.json: nothing rebuilt
+    assert len(made) == 2
+    import os
+    st = auth.TOKEN_FILE.stat()
+    os.utime(auth.TOKEN_FILE, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))  # auth.py saved a new login
+    assert lis.reconnect_if_new_login() is True
+    assert lis.calendar == ("calendar", "creds2") and len(made) == 4

@@ -25,6 +25,7 @@ from googleapiclient.discovery import build
 
 import actions
 import alerts
+import auth
 import calwatch
 import changes
 import deadlines
@@ -148,11 +149,24 @@ class Tap:
 class Listener:
     def __init__(self, cfg, state, tg):
         self.cfg, self.state, self.tg = cfg, state, tg
+        self.connect()
+        self.learn_after = cfg.get("approval", {}).get("learn_after_skips", 3)
+        self._last_error_reply = 0.0
+
+    def connect(self):
+        self._token = auth.token_stamp()
         creds = get_credentials()
         self.calendar = build("calendar", "v3", credentials=creds)
         self.tasks = build("tasks", "v1", credentials=creds)
-        self.learn_after = cfg.get("approval", {}).get("learn_after_skips", 3)
-        self._last_error_reply = 0.0
+
+    def reconnect_if_new_login(self):
+        """After `auth.py` the clients built at start-up still hold the old, revoked login (3 Oct: login done at
+        12:42, the bot still failed at 12:44). A changed token.json means: load it again."""
+        if auth.token_stamp() == self._token:
+            return False
+        self.connect()
+        log.info("token.json changed: using the new Google login")
+        return True
 
     def _tz(self):
         return ZoneInfo(self.cfg["timezone"])
@@ -676,6 +690,13 @@ def main():
                 log.warning("%s; retrying every 30 s", e)
             time.sleep(30)
             continue
+        try:
+            listener.reconnect_if_new_login()
+        except AuthExpired:
+            pass  # the new token.json doesn't work either; taps report it
+        except Exception as e:
+            if not alerts.is_offline_error(e):
+                log.exception("couldn't load the new Google login")
         # Answer slow taps in this batch first: a tap queued behind a slow one used to be answered too late.
         for update in updates:
             cq = update.get("callback_query")

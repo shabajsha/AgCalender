@@ -51,7 +51,9 @@ def create_app(services=_services, state_factory=State, config=load_config):
 
     def ctx():
         """cfg, state, calendar, tasks and a listener-like object for the helpers shared with the bot."""
-        if not google:
+        import auth
+        if not google or google.get("token") != auth.token_stamp():  # first request, or you logged in again
+            google["token"] = auth.token_stamp()
             google["cal"], google["tasks"] = services()
         cfg = config()
         tz = ZoneInfo(cfg["timezone"])
